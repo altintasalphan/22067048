@@ -18,10 +18,41 @@ This repository provides a comprehensive GUI framework for developing and integr
 - **Comprehensive ML Support**: Integration with popular machine learning libraries
 - **GPU Acceleration**: CUDA support for enhanced performance on compatible hardware
 - **Extensible Architecture**: Designed to accommodate additional functionalities
+- **Advanced Loss Function Selection**: Customize models with different loss functions
+- **Missing Data Handling**: Multiple strategies for handling missing values
+- **Bayesian Methods**: Implementations of Bayesian algorithms with customizable parameters
+- **Support Vector Machine**: Classification and regression support with multiple kernels
+- **Visualization Capabilities**: Comprehensive visualization of model performance and data
 
-## 🤝 Repository Information
+## 🧩 Enhanced Features and Improvements
 
-This project is a fork developed as part of the Yildiz Technical University MKT3434 Course (2025). For the base GUI and original implementation, please refer to the [original repository](https://github.com/bayraktare/MKT3434_2025).
+### Classical Machine Learning
+- **Support Vector Machine (SVM)**: Both classification (SVC) and regression (SVR) implementations
+- **Kernel Selection**: Linear, RBF, Polynomial, and Sigmoid kernels
+- **SGD Classification/Regression**: Stochastic Gradient Descent with different loss functions
+- **Hyperparameter Tuning**: Fine-grained control over C, epsilon (for SVR), and kernel parameters
+
+### Loss Function Customization
+- **Regression Loss Functions**: MSE, MAE, Huber Loss
+- **Classification Loss Functions**: Cross-Entropy, Hinge Loss
+- **Dynamic Model Training**: Updates training logic based on selected loss function
+
+### Bayesian Methods
+- **Gaussian Naive Bayes**: Configurable var_smoothing parameter
+- **Prior Probabilities**: Choose between uniform or custom prior probabilities
+- **Visualization**: Dedicated visualization for Bayesian model performance
+
+### Missing Data Handling
+- **Multiple Imputation Methods**: Mean, Median, Most Frequent, Forward Fill, Backward Fill
+- **Testing Framework**: Option to introduce missing values for testing imputation strategies
+- **Method Comparison**: Tool to compare the effectiveness of different imputation methods
+- **Integration with scikit-learn**: Uses SimpleImputer for robust missing data handling
+
+### Deep Learning Enhancements
+- **Layer Configuration**: Improved interface for adding and configuring neural network layers
+- **Loss Function Selection**: Apply different loss functions to neural networks
+- **Model Visualization**: Enhanced visualization of training history and model performance
+- **CNN Support**: Convolutional Neural Network architecture builder
 
 ## 🚀 Getting Started
 
@@ -71,19 +102,29 @@ This project is a fork developed as part of the Yildiz Technical University MKT3
    python -m pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvision torchaudio opencv-python opencv-contrib-python scipy fastai kornia
    ```
 
-## 🖥️ Development Environment
+## 📊 Using the Enhanced Features
 
-This GUI framework has been developed and tested in the following environment:
+### Missing Data Handling
+1. Load a dataset and check "Introduce Missing Values" to test imputation methods
+2. Select an imputation method from the dropdown menu
+3. Use the "Compare Imputation Methods" button to evaluate different strategies
 
-- **Operating System**: WSL2 (Ubuntu 24.04.01 LTS) on Windows 11 IoT Enterprise LTSC (24H2 Build 26100.3476)
-- **Python**: 3.12.3 within a Virtual Environment (venv)
-- **GPU Configuration**:
-  - CUDA 12.8
-  - TensorRT 10.9
-  - cuDNN 9.8.0
-  - NVIDIA RTX 3050 Ti with Studio Driver 572.83
-- **CPU**: Intel i7-11370H
-- **IDE**: Visual Studio Code
+### Loss Function Selection
+1. Navigate to the Classical ML or Deep Learning tab
+2. Select the desired loss function from the radio buttons
+3. Train your model with the selected loss function
+
+### Support Vector Machine/Regression
+1. Go to the Classical ML tab
+2. Choose from SVM (classification) or SVR (regression)
+3. Configure kernel type and parameters
+4. Click "Train" to build and evaluate the model
+
+### Bayesian Methods
+1. Navigate to the Bayesian Methods tab
+2. Configure var_smoothing parameter
+3. Choose between uniform or custom prior probabilities
+4. Click "Train Naive Bayes" to build the model
 
 ## ⚠️ Known Issues and Solutions
 
@@ -92,7 +133,7 @@ When running with GPU setup on WSL2, you may encounter Qt/XCB plugin loading err
 **Temporary Solution**:
 ```bash
 export QT_QPA_PLATFORM=offscreen
-python base_gui_for_MKT3434_by_eb.py
+python 22067048.py
 ```
 
 **Permanent Solution** (requires virtual environment):
@@ -119,6 +160,12 @@ python base_gui_for_MKT3434_by_eb.py
        unset QT_QPA_PLATFORM
    fi
    ```
+
+### Additional Dependencies
+The enhanced version requires the following additional dependencies:
+```bash
+python -m pip install scikit-learn>=1.0.0
+```
 
 ## 📞 Support
 
