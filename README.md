@@ -24,35 +24,9 @@ This repository provides a comprehensive GUI framework for developing and integr
 - **Support Vector Machine**: Classification and regression support with multiple kernels
 - **Visualization Capabilities**: Comprehensive visualization of model performance and data
 
-## 🧩 Enhanced Features and Improvements
+## 🤝 Repository Information
 
-### Classical Machine Learning
-- **Support Vector Machine (SVM)**: Both classification (SVC) and regression (SVR) implementations
-- **Kernel Selection**: Linear, RBF, Polynomial, and Sigmoid kernels
-- **SGD Classification/Regression**: Stochastic Gradient Descent with different loss functions
-- **Hyperparameter Tuning**: Fine-grained control over C, epsilon (for SVR), and kernel parameters
-
-### Loss Function Customization
-- **Regression Loss Functions**: MSE, MAE, Huber Loss
-- **Classification Loss Functions**: Cross-Entropy, Hinge Loss
-- **Dynamic Model Training**: Updates training logic based on selected loss function
-
-### Bayesian Methods
-- **Gaussian Naive Bayes**: Configurable var_smoothing parameter
-- **Prior Probabilities**: Choose between uniform or custom prior probabilities
-- **Visualization**: Dedicated visualization for Bayesian model performance
-
-### Missing Data Handling
-- **Multiple Imputation Methods**: Mean, Median, Most Frequent, Forward Fill, Backward Fill
-- **Testing Framework**: Option to introduce missing values for testing imputation strategies
-- **Method Comparison**: Tool to compare the effectiveness of different imputation methods
-- **Integration with scikit-learn**: Uses SimpleImputer for robust missing data handling
-
-### Deep Learning Enhancements
-- **Layer Configuration**: Improved interface for adding and configuring neural network layers
-- **Loss Function Selection**: Apply different loss functions to neural networks
-- **Model Visualization**: Enhanced visualization of training history and model performance
-- **CNN Support**: Convolutional Neural Network architecture builder
+This project is a fork developed as part of the Yildiz Technical University MKT3434 Course (2025). For the base GUI and original implementation, please refer to the [original repository](https://github.com/bayraktare/MKT3434_2025).
 
 ## 🚀 Getting Started
 
@@ -147,6 +121,21 @@ python -m pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvisi
 3. Choose between uniform or custom prior probabilities
 4. Click "Train Naive Bayes" to build the model
 
+## 🖥️ Development Environment
+
+This GUI framework has been developed and tested in the following environment:
+
+- **Operating System**: Windows 11 IoT Enterprise LTSC with WSL2 (Ubuntu 24.04.01 LTS)
+- **Python**: 3.12.3 within a Virtual Environment (venv)
+- **Hardware**:
+  - **CPU**: Intel i7-11370H
+  - **GPU**: NVIDIA RTX 3050 Ti with Studio Driver 572.83
+- **ML Framework Configuration**:
+  - CUDA 12.8
+  - cuDNN 9.8.0
+  - TensorRT 10.9
+- **IDE**: Visual Studio Code
+
 ## ⚠️ Known Issues and Solutions
 
 When running with GPU setup on WSL2, you may encounter Qt/XCB plugin loading errors. To resolve this:
@@ -182,7 +171,17 @@ python 22067048.py
    fi
    ```
 
+## 📚 Additional Resources
 
+For further assistance with installation issues or for more detailed information about the dependencies, please refer to these official resources:
+
+- **TensorFlow Installation**: [TensorFlow Installation Guide](https://www.tensorflow.org/install/pip)
+- **CUDA Installation**: [CUDA Toolkit Release Notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html)
+- **cuDNN Installation**: [cuDNN Documentation](https://docs.nvidia.com/deeplearning/cudnn/latest/)
+- **TensorRT Installation** (optional): [TensorRT Documentation](https://docs.nvidia.com/deeplearning/tensorrt/latest/index.html)
+- **CUDA-Enabled GPUs**: [List of CUDA-Enabled NVIDIA GPUs](https://developer.nvidia.com/cuda-gpus)
+
+If you encounter any problems with running the program or installing prerequisites, the resources above should be your first reference point for troubleshooting.
 
 ## 📞 Support
 
