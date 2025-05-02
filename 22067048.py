@@ -1,12 +1,22 @@
+"""
+Setup Initialization:
+System   : Ubuntu 16.04+, Windows 7+ (WSL2 for GPU), macOS 12+; optional NVIDIA CUDA GPU; Python 3.9–3.12; pip ≥19.0 (Linux/Win) or ≥20.3 (macOS).
+VirtualEnv: python -m venv <env_dir>; activate with `source <env_dir>/bin/activate` (Linux/macOS) or `<env_dir>\Scripts\activate` (Windows) to isolate project dependencies.
+pip Upgrade: python -m pip install --upgrade pip  # ensures latest installer and dependency resolver.
+TensorFlow: CPU-only → pip install tensorflow; GPU → pip install tensorflow[and-cuda]  # Windows GPU support requires WSL2.
+Verify TF : GPU → python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"; CPU → python -c "import tensorflow as tf; print(tf.reduce_sum(tf.random.normal([1000,1000])))"
+Dependencies: pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvision torchaudio opencv-python opencv-contrib-python scipy fastai kornia plotly umap-learn
+"""
 import sys
+import os
 import numpy as np
 import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                           QHBoxLayout, QTabWidget, QPushButton, QLabel, 
-                           QComboBox, QFileDialog, QSpinBox, QDoubleSpinBox,
-                           QGroupBox, QScrollArea, QTextEdit, QStatusBar,
-                           QProgressBar, QCheckBox, QGridLayout, QMessageBox,
-                           QDialog, QLineEdit, QRadioButton, QButtonGroup)
+                             QHBoxLayout, QTabWidget, QPushButton, QLabel, 
+                             QComboBox, QFileDialog, QSpinBox, QDoubleSpinBox,
+                             QGroupBox, QScrollArea, QTextEdit, QStatusBar,
+                             QProgressBar, QCheckBox, QGridLayout, QMessageBox,
+                             QDialog, QLineEdit, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import Qt
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -21,11 +31,20 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, confusion_matrix, r2_score
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.manifold import TSNE
+from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, confusion_matrix, r2_score, silhouette_score
 from sklearn.impute import SimpleImputer
 from sklearn.base import clone
+from sklearn.model_selection import cross_val_score
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, losses
+import plotly.express as px
+from plotly.subplots import make_subplots
+import umap
+
+# Ensure xcb is used for Qt platform
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
 class MLCourseGUI(QMainWindow):
     def __init__(self):
@@ -511,6 +530,31 @@ class MLCourseGUI(QMainWindow):
         
         data_layout.addLayout(missing_values_section)
         
+        # Validation method section
+        validation_section = QHBoxLayout()
+        validation_section.addWidget(QLabel("Validation Method:"))
+        self.validation_method_combo = QComboBox()
+        self.validation_method_combo.addItems(["Train-Test Split", "K-Fold Cross-Validation"])
+        validation_section.addWidget(self.validation_method_combo)
+        
+        # K-Fold parameter
+        self.kfold_spin = QSpinBox()
+        self.kfold_spin.setRange(2, 10)
+        self.kfold_spin.setValue(5)
+        self.kfold_spin.setEnabled(False)  # Enabled only when K-Fold is selected
+        
+        # Enable/disable kfold_spin based on selection
+        def update_kfold_spin():
+            is_kfold = self.validation_method_combo.currentText() == "K-Fold Cross-Validation"
+            self.kfold_spin.setEnabled(is_kfold)
+        
+        self.validation_method_combo.currentIndexChanged.connect(update_kfold_spin)
+        
+        validation_section.addWidget(QLabel("Folds:"))
+        validation_section.addWidget(self.kfold_spin)
+        
+        data_layout.addLayout(validation_section)
+        
         data_group.setLayout(data_layout)
         self.layout.addWidget(data_group)
     
@@ -815,14 +859,63 @@ class MLCourseGUI(QMainWindow):
             self.show_error(f"Error training Naive Bayes model: {str(e)}")
     
     def create_dim_reduction_tab(self):
-        """Create the dimensionality reduction tab"""
+        """Create the dimensionality reduction tab with enhanced methods"""
         widget = QWidget()
         layout = QGridLayout(widget)
         
-        # K-Means section
+        # PCA section
+        pca_group = QGroupBox("Principal Component Analysis")
+        pca_layout = QVBoxLayout()
+        pca_params = self.create_algorithm_group(
+            "PCA Parameters",
+            {"n_components": "int",
+             "whiten": "checkbox"}
+        )
+        pca_layout.addWidget(pca_params)
+        pca_group.setLayout(pca_layout)
+        layout.addWidget(pca_group, 0, 0)
+        
+        # LDA section
+        lda_group = QGroupBox("Linear Discriminant Analysis")
+        lda_layout = QVBoxLayout()
+        lda_params = self.create_algorithm_group(
+            "LDA Parameters",
+            {"n_components": "int"}
+        )
+        lda_layout.addWidget(lda_params)
+        lda_group.setLayout(lda_layout)
+        layout.addWidget(lda_group, 0, 1)
+        
+        # t-SNE section
+        tsne_group = QGroupBox("t-SNE")
+        tsne_layout = QVBoxLayout()
+        tsne_params = self.create_algorithm_group(
+            "t-SNE Parameters",
+            {"n_components": ["2", "3"],
+             "perplexity": "double",
+             "learning_rate": "double",
+             "n_iter": "int"}
+        )
+        tsne_layout.addWidget(tsne_params)
+        tsne_group.setLayout(tsne_layout)
+        layout.addWidget(tsne_group, 1, 0)
+        
+        # UMAP section
+        umap_group = QGroupBox("UMAP")
+        umap_layout = QVBoxLayout()
+        umap_params = self.create_algorithm_group(
+            "UMAP Parameters",
+            {"n_components": ["2", "3"],
+             "n_neighbors": "int",
+             "min_dist": "double"}
+        )
+        umap_layout.addWidget(umap_params)
+        umap_group.setLayout(umap_layout)
+        layout.addWidget(umap_group, 1, 1)
+        
+        # K-Means section with elbow method
         kmeans_group = QGroupBox("K-Means Clustering")
         kmeans_layout = QVBoxLayout()
-        
         kmeans_params = self.create_algorithm_group(
             "K-Means Parameters",
             {"n_clusters": "int",
@@ -831,24 +924,135 @@ class MLCourseGUI(QMainWindow):
         )
         kmeans_layout.addWidget(kmeans_params)
         
+        # Elbow method
+        elbow_layout = QHBoxLayout()
+        elbow_layout.addWidget(QLabel("Max K for Elbow:"))
+        self.elbow_max_k_spin = QSpinBox()
+        self.elbow_max_k_spin.setRange(2, 20)
+        self.elbow_max_k_spin.setValue(10)
+        elbow_layout.addWidget(self.elbow_max_k_spin)
+        elbow_btn = QPushButton("Apply Elbow Method")
+        elbow_btn.clicked.connect(self.apply_elbow_method)
+        elbow_layout.addWidget(elbow_btn)
+        kmeans_layout.addLayout(elbow_layout)
+        
         kmeans_group.setLayout(kmeans_layout)
-        layout.addWidget(kmeans_group, 0, 0)
+        layout.addWidget(kmeans_group, 2, 0, 1, 2)
         
-        # PCA section
-        pca_group = QGroupBox("Principal Component Analysis")
-        pca_layout = QVBoxLayout()
-        
-        pca_params = self.create_algorithm_group(
-            "PCA Parameters",
-            {"n_components": "int",
-             "whiten": "checkbox"}
-        )
-        pca_layout.addWidget(pca_params)
-        
-        pca_group.setLayout(pca_layout)
-        layout.addWidget(pca_group, 0, 1)
+        # Compare methods button
+        compare_btn = QPushButton("Compare Dimensionality Reduction Methods")
+        compare_btn.clicked.connect(self.compare_dim_reduction)
+        layout.addWidget(compare_btn, 3, 0, 1, 2)
         
         return widget
+    
+    def apply_elbow_method(self):
+        """Apply elbow method to determine optimal number of clusters for K-Means"""
+        if self.X_train is None:
+            self.show_error("Please load a dataset first")
+            return
+        
+        try:
+            max_k = self.elbow_max_k_spin.value()
+            inertias = []
+            for k in range(1, max_k + 1):
+                model = KMeans(n_clusters=k, random_state=42)
+                model.fit(self.X_train)
+                inertias.append(model.inertia_)
+            
+            # Plot elbow curve using Plotly
+            fig = px.line(x=range(1, max_k + 1), y=inertias, markers=True, title="Elbow Method for K-Means")
+            fig.update_layout(xaxis_title="Number of Clusters (k)", yaxis_title="Inertia")
+            
+            # Display in dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Elbow Method")
+            layout = QVBoxLayout(dialog)
+            web_view = QWebEngineView()
+            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
+            layout.addWidget(web_view)
+            dialog.resize(800, 600)
+            dialog.exec()
+            
+        except Exception as e:
+            self.show_error(f"Error applying elbow method: {str(e)}")
+    
+    def compare_dim_reduction(self):
+        """Compare selected dimensionality reduction methods"""
+        if self.X_train is None or self.y_train is None:
+            self.show_error("Please load a dataset first")
+            return
+        
+        # Dialog to select methods
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Methods to Compare")
+        layout = QVBoxLayout(dialog)
+        
+        methods = ["PCA", "LDA", "t-SNE", "UMAP"]
+        self.compare_checkboxes = {}
+        for method in methods:
+            cb = QCheckBox(method)
+            self.compare_checkboxes[method] = cb
+            layout.addWidget(cb)
+        
+        btn = QPushButton("Compare")
+        btn.clicked.connect(lambda: self.perform_comparison(dialog))
+        layout.addWidget(btn)
+        
+        dialog.exec()
+    
+    def perform_comparison(self, dialog):
+        """Perform comparison of selected dimensionality reduction methods"""
+        selected_methods = [method for method, cb in self.compare_checkboxes.items() if cb.isChecked()]
+        if not selected_methods:
+            self.show_error("Please select at least one method")
+            return
+        dialog.accept()
+        
+        try:
+            # Apply each method with n_components=2
+            projections = {}
+            for method in selected_methods:
+                if method == "PCA":
+                    model = PCA(n_components=2)
+                    X_proj = model.fit_transform(self.X_train)
+                elif method == "LDA":
+                    n_classes = len(np.unique(self.y_train))
+                    n_components = min(2, n_classes - 1)
+                    model = LinearDiscriminantAnalysis(n_components=n_components)
+                    X_proj = model.fit_transform(self.X_train, self.y_train)
+                elif method == "t-SNE":
+                    model = TSNE(n_components=2, random_state=42)
+                    X_proj = model.fit_transform(self.X_train)
+                elif method == "UMAP":
+                    model = umap.UMAP(n_components=2, random_state=42)
+                    X_proj = model.fit_transform(self.X_train)
+                projections[method] = X_proj
+            
+            # Create subplot figure
+            fig = make_subplots(rows=1, cols=len(projections), subplot_titles=selected_methods)
+            
+            for i, (method, X_proj) in enumerate(projections.items(), start=1):
+                fig.add_trace(
+                    px.scatter(x=X_proj[:, 0], y=X_proj[:, 1], color=self.y_train).data[0],
+                    row=1, col=i
+                )
+            
+            # Update layout
+            fig.update_layout(height=600, width=800 * len(projections), title_text="Dimensionality Reduction Comparison")
+            
+            # Display in dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Comparison of Dimensionality Reduction Methods")
+            layout = QVBoxLayout(dialog)
+            web_view = QWebEngineView()
+            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
+            layout.addWidget(web_view)
+            dialog.resize(800 * len(projections), 600)
+            dialog.exec()
+            
+        except Exception as e:
+            self.show_error(f"Error comparing dimensionality reduction methods: {str(e)}")
     
     def create_rl_tab(self):
         """Create the reinforcement learning tab"""
@@ -936,6 +1140,11 @@ class MLCourseGUI(QMainWindow):
                     widget.setValue(8)
                 elif param_name == "degree":
                     widget.setValue(3)
+                elif param_name == "n_components":
+                    widget.setRange(1, 10)
+                    widget.setValue(2)
+                elif param_name == "n_neighbors":
+                    widget.setValue(15)
                 else:
                     widget.setValue(5)
             elif param_type == "double":
@@ -952,6 +1161,15 @@ class MLCourseGUI(QMainWindow):
                 elif param_name == "tol":
                     widget.setRange(1e-6, 0.1)
                     widget.setValue(1e-4)
+                elif param_name == "perplexity":
+                    widget.setRange(5.0, 50.0)
+                    widget.setValue(30.0)
+                elif param_name == "learning_rate":
+                    widget.setRange(10.0, 1000.0)
+                    widget.setValue(200.0)
+                elif param_name == "min_dist":
+                    widget.setRange(0.0, 1.0)
+                    widget.setValue(0.1)
                 else:
                     widget.setRange(0.0001, 1000.0)
                     widget.setValue(1.0)
@@ -1093,50 +1311,124 @@ class MLCourseGUI(QMainWindow):
                     whiten=params.get('whiten', False)
                 )
                 
+            elif model_name == "LDA Parameters":
+                n_components = params.get('n_components', min(self.X_train.shape[1], len(np.unique(self.y_train)) - 1))
+                model = LinearDiscriminantAnalysis(n_components=n_components)
+                
+            elif model_name == "t-SNE Parameters":
+                n_components = int(params.get('n_components', '2'))
+                model = TSNE(
+                    n_components=n_components,
+                    perplexity=params.get('perplexity', 30.0),
+                    learning_rate=params.get('learning_rate', 200.0),
+                    n_iter=params.get('n_iter', 1000),
+                    random_state=42
+                )
+                
+            elif model_name == "UMAP Parameters":
+                n_components = int(params.get('n_components', '2'))
+                model = umap.UMAP(
+                    n_components=n_components,
+                    n_neighbors=params.get('n_neighbors', 15),
+                    min_dist=params.get('min_dist', 0.1),
+                    random_state=42
+                )
+                
             else:
                 self.show_error(f"Unknown model: {model_name}")
                 return
             
-            # Train model
-            model.fit(self.X_train, self.y_train)
-            
-            # Make predictions
-            if model_name == "PCA Parameters":
-                # Transform data with PCA
-                X_pca = model.transform(self.X_test)
+            # Handle dimensionality reduction methods separately
+            if model_name in ["PCA Parameters", "LDA Parameters", "t-SNE Parameters", "UMAP Parameters"]:
+                if model_name == "PCA Parameters":
+                    X_transformed = model.fit_transform(self.X_train)
+                    X_test_transformed = model.transform(self.X_test)
+                    self.visualize_projection(X_test_transformed, self.y_test, method='PCA')
+                    self.update_pca_metrics(model)
                 
-                # Visualize PCA components
-                self.visualize_pca(model, X_pca)
+                elif model_name == "LDA Parameters":
+                    X_transformed = model.fit_transform(self.X_train, self.y_train)
+                    X_test_transformed = model.transform(self.X_test)
+                    self.visualize_projection(X_test_transformed, self.y_test, method='LDA')
+                    silhouette_avg = silhouette_score(X_test_transformed, self.y_test) if len(np.unique(self.y_test)) > 1 else None
+                    self.metrics_text.setText(f"LDA Analysis Results:\n\nSilhouette Score: {silhouette_avg:.4f}" if silhouette_avg else "LDA Analysis Results:\n\nNo metrics available")
                 
-                # Update metrics text with explained variance
-                self.update_pca_metrics(model)
+                elif model_name == "t-SNE Parameters":
+                    self.status_bar.showMessage("Computing t-SNE...")
+                    X_test_transformed = model.fit_transform(self.X_test)
+                    self.visualize_projection(X_test_transformed, self.y_test, method='t-SNE', n_components=n_components)
+                    self.status_bar.showMessage("t-SNE computation complete")
                 
-            elif model_name == "K-Means Parameters":
-                # Predict clusters
-                y_pred = model.predict(self.X_test)
-                
-                # Visualize clusters
-                self.update_visualization(y_pred)
-                
-                # Update metrics with inertia and silhouette score
-                self.update_kmeans_metrics(model, self.X_test, y_pred)
+                elif model_name == "UMAP Parameters":
+                    X_transformed = model.fit_transform(self.X_train)
+                    X_test_transformed = model.transform(self.X_test)
+                    self.visualize_projection(X_test_transformed, self.y_test, method='UMAP', n_components=n_components)
                 
             else:
-                # Regular model prediction
-                y_pred = model.predict(self.X_test)
+                # Perform cross-validation if selected
+                validation_method = self.validation_method_combo.currentText()
+                if validation_method == "K-Fold Cross-Validation" and model_name not in ["K-Means Parameters"]:
+                    k = self.kfold_spin.value()
+                    # Determine scoring metric
+                    if len(np.unique(self.y_train)) > 10:  # Regression
+                        scoring = 'neg_mean_squared_error'
+                    else:  # Classification
+                        scoring = 'accuracy'
+                    
+                    # Perform cross-validation
+                    cv_scores = cross_val_score(model, self.X_train, self.y_train, cv=k, scoring=scoring)
+                    
+                    # Display cross-validation results
+                    if scoring == 'neg_mean_squared_error':
+                        cv_mse = -cv_scores
+                        metrics_text = f"Cross-Validation MSE: {cv_mse.mean():.4f} ± {cv_mse.std():.4f}\n"
+                    else:
+                        metrics_text = f"Cross-Validation Accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}\n"
+                    self.metrics_text.setText(metrics_text)
                 
-                # Store current model
-                self.current_model = model
+                # Train model on entire training set
+                model.fit(self.X_train, self.y_train)
                 
-                # Update visualization and metrics
-                self.update_visualization(y_pred)
-                self.update_metrics(y_pred)
+                # Make predictions
+                if model_name == "K-Means Parameters":
+                    y_pred = model.predict(self.X_test)
+                    self.update_visualization(y_pred)
+                    self.update_kmeans_metrics(model, self.X_test, y_pred)
+                else:
+                    y_pred = model.predict(self.X_test)
+                    self.current_model = model
+                    self.update_visualization(y_pred)
+                    self.update_metrics(y_pred)
             
             # Update status
             self.status_bar.showMessage(f"Trained {model_name}")
             
         except Exception as e:
             self.show_error(f"Error training {model_name}: {str(e)}")
+    
+    def visualize_projection(self, X_proj, y, method, n_components=2):
+        """Visualize the projected data using Plotly"""
+        try:
+            if n_components == 2:
+                fig = px.scatter(x=X_proj[:, 0], y=X_proj[:, 1], color=y, title=f"{method} Projection")
+            elif n_components == 3:
+                fig = px.scatter_3d(x=X_proj[:, 0], y=X_proj[:, 1], z=X_proj[:, 2], color=y, title=f"{method} Projection")
+            else:
+                self.show_error("Only 2D and 3D projections are supported")
+                return
+            
+            # Display the plot in a dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"{method} Visualization")
+            layout = QVBoxLayout(dialog)
+            web_view = QWebEngineView()
+            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
+            layout.addWidget(web_view)
+            dialog.resize(800, 600)
+            dialog.exec()
+            
+        except Exception as e:
+            self.show_error(f"Error visualizing {method} projection: {str(e)}")
     
     def visualize_pca(self, pca_model, X_pca):
         """Visualize PCA components"""
@@ -1202,22 +1494,17 @@ class MLCourseGUI(QMainWindow):
         metrics_text = "K-Means Clustering Results:\n\n"
         
         # Inertia (within-cluster sum-of-squares)
-        metrics_text += f"Inertia: {kmeans_model.inertia_:.4f}\n\n"
+        metrics_text += f"Inertia: {kmeans_model.inertia_:.4f}\n"
+        
+        # Silhouette Score
+        silhouette_avg = silhouette_score(X_test, y_pred)
+        metrics_text += f"Silhouette Score: {silhouette_avg:.4f}\n"
         
         # Cluster sizes
         cluster_sizes = np.bincount(y_pred)
-        metrics_text += "Cluster Sizes:\n"
+        metrics_text += "\nCluster Sizes:\n"
         for i, size in enumerate(cluster_sizes):
             metrics_text += f"Cluster {i}: {size} samples ({size/len(y_pred):.2%})\n"
-        
-        # Calculate silhouette score if sklearn.metrics is available
-        try:
-            from sklearn.metrics import silhouette_score
-            silhouette_avg = silhouette_score(X_test, y_pred)
-            metrics_text += f"\nSilhouette Score: {silhouette_avg:.4f}\n"
-            metrics_text += "(Closer to 1 means better-defined clusters)"
-        except:
-            pass
         
         self.metrics_text.setText(metrics_text)
     
