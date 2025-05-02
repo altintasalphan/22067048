@@ -7,7 +7,7 @@
 
 ## 📋 Overview
 
-This repository provides a comprehensive GUI framework for developing and integrating machine learning methods, created for the MKT3434 Course at Yildiz Technical University's Department of Mechatronics Engineering. The application leverages PyQt6 to deliver an intuitive interface that supports both classical machine learning techniques and advanced deep learning implementations.
+This repository provides a comprehensive GUI framework for developing and integrating machine learning methods, created for the MKT3434 Course at Yildiz Technical University's Department of Mechatronics Engineering. The application leverages PyQt6 to deliver an intuitive interface that supports both classical machine learning techniques and advanced deep learning implementations, now enhanced with dimensionality reduction and cross-validation features critical for real-world robotics and mechatronics applications.
 
 **Course Instructor:** [Asst. Prof. Dr. Ertuğrul Bayraktar](https://github.com/bayraktare)  
 **Developed by:** [Alphan Bartu ALTINTAŞ](https://github.com/altintasalphan) - Mechatronics Engineering Student (22067048)
@@ -22,7 +22,9 @@ This repository provides a comprehensive GUI framework for developing and integr
 - **Missing Data Handling**: Multiple strategies for handling missing values
 - **Bayesian Methods**: Implementations of Bayesian algorithms with customizable parameters
 - **Support Vector Machine**: Classification and regression support with multiple kernels
-- **Visualization Capabilities**: Comprehensive visualization of model performance and data
+- **Visualization Capabilities**: Enhanced with Plotly for interactive 2D/3D plots
+- **Dimensionality Reduction**: PCA, LDA, t-SNE, UMAP, and K-Means with advanced features
+- **Cross-Validation**: K-fold cross-validation with user-selectable k and detailed metrics
 
 ## 🤝 Repository Information
 
@@ -94,32 +96,29 @@ If a tensor is returned, you've installed TensorFlow successfully.
 
 #### 4. Install Additional Dependencies
 ```bash
-python -m pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvision torchaudio opencv-python opencv-contrib-python scipy fastai kornia scikit-learn>=1.0.0
+python -m pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvision torchaudio opencv-python opencv-contrib-python scipy fastai kornia plotly umap-learn
 ```
 
 ## 📊 Using the Enhanced Features
 
-### Missing Data Handling
-1. Load a dataset and check "Introduce Missing Values" to test imputation methods
-2. Select an imputation method from the dropdown menu
-3. Use the "Compare Imputation Methods" button to evaluate different strategies
+### Dimensionality Reduction
+1. Navigate to the **Dimensionality Reduction** tab
+2. Configure parameters for:
+   - **PCA**: Select number of components and visualize explained variance
+   - **LDA**: Supervised reduction with class separation metrics (e.g., silhouette score)
+   - **t-SNE**: Interactive 2D/3D projections with perplexity tuning
+   - **UMAP**: Faster alternative to t-SNE with configurable neighbors and distance
+   - **K-Means**: Configurable clusters with elbow method support
+3. Click "Train" for individual methods or "Compare Dimensionality Reduction Methods" to visualize multiple methods side by side
 
-### Loss Function Selection
-1. Navigate to the Classical ML or Deep Learning tab
-2. Select the desired loss function from the radio buttons
-3. Train your model with the selected loss function
+### Cross-Validation
+1. In the **Data Management** section, select "K-Fold Cross-Validation" under "Validation Method"
+2. Set the number of folds (k) using the spin box (2-10)
+3. Train a model under the **Classical ML** tab to see cross-validation metrics (mean and std of accuracy or MSE)
 
-### Support Vector Machine/Regression
-1. Go to the Classical ML tab
-2. Choose from SVM (classification) or SVR (regression)
-3. Configure kernel type and parameters
-4. Click "Train" to build and evaluate the model
-
-### Bayesian Methods
-1. Navigate to the Bayesian Methods tab
-2. Configure var_smoothing parameter
-3. Choose between uniform or custom prior probabilities
-4. Click "Train Naive Bayes" to build the model
+### Interactive Visualization
+- Uses Plotly for interactive 2D/3D scatter plots in dimensionality reduction
+- Elbow method plots and method comparisons are displayed in separate dialogs
 
 ## 🖥️ Development Environment
 
@@ -142,7 +141,7 @@ When running with GPU setup on WSL2, you may encounter Qt/XCB plugin loading err
 
 **Temporary Solution**:
 ```bash
-export QT_QPA_PLATFORM=xcb #you can try wayland or offscreen 
+export QT_QPA_PLATFORM=xcb
 python 22067048.py
 ```
 
@@ -155,7 +154,7 @@ python 22067048.py
        _OLD_QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-}"
    fi
 
-   # Set Qt to use xcb, wayland or offscreen rendering
+   # Set Qt to use xcb
    export QT_QPA_PLATFORM=xcb
    ```
 
@@ -180,6 +179,8 @@ For further assistance with installation issues or for more detailed information
 - **cuDNN Installation**: [cuDNN Documentation](https://docs.nvidia.com/deeplearning/cudnn/latest/)
 - **TensorRT Installation** (optional): [TensorRT Documentation](https://docs.nvidia.com/deeplearning/tensorrt/latest/index.html)
 - **CUDA-Enabled GPUs**: [List of CUDA-Enabled NVIDIA GPUs](https://developer.nvidia.com/cuda-gpus)
+- **Plotly**: [Plotly Python Documentation](https://plotly.com/python/)
+- **UMAP**: [UMAP Documentation](https://umap-learn.readthedocs.io/en/latest/)
 
 If you encounter any problems with running the program or installing prerequisites, the resources above should be your first reference point for troubleshooting.
 
