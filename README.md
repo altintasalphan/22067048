@@ -142,7 +142,7 @@ When running with GPU setup on WSL2, you may encounter Qt/XCB plugin loading err
 
 **Temporary Solution**:
 ```bash
-export QT_QPA_PLATFORM=offscreen
+export QT_QPA_PLATFORM=xcb #you can try wayland or offscreen 
 python 22067048.py
 ```
 
@@ -155,8 +155,8 @@ python 22067048.py
        _OLD_QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-}"
    fi
 
-   # Set Qt to use offscreen rendering
-   export QT_QPA_PLATFORM=offscreen
+   # Set Qt to use xcb, wayland or offscreen rendering
+   export QT_QPA_PLATFORM=xcb
    ```
 
 2. Add to deactivation section in the same script:
