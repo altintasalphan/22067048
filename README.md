@@ -124,15 +124,15 @@ python -m pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvisi
 
 This GUI framework has been developed and tested in the following environment:
 
-- **Operating System**: Windows 11 IoT Enterprise LTSC with WSL2 (Ubuntu 24.04.01 LTS)
+- **Operating System**: Windows 11 IoT Enterprise LTSC with WSL2 (Ubuntu 24.04.02 LTS)
 - **Python**: 3.12.3 within a Virtual Environment (venv)
 - **Hardware**:
   - **CPU**: Intel i7-11370H
-  - **GPU**: NVIDIA RTX 3050 Ti with Studio Driver 572.83
+  - **GPU**: NVIDIA RTX 3050 Ti with Studio Driver 576.02
 - **ML Framework Configuration**:
-  - CUDA 12.8
-  - cuDNN 9.8.0
-  - TensorRT 10.9
+  - CUDA 12.9
+  - cuDNN 9.10.0
+  - TensorRT 10.11
 - **IDE**: Visual Studio Code
 
 ## ⚠️ Known Issues and Solutions
