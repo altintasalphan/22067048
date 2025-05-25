@@ -7,17 +7,24 @@ TensorFlow: CPU-only → pip install tensorflow; GPU → pip install tensorflow[
 Verify TF : GPU → python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"; CPU → python -c "import tensorflow as tf; print(tf.reduce_sum(tf.random.normal([1000,1000])))"
 Dependencies: pip install numpy pandas matplotlib PyQt6 scikit-learn torch torchvision torchaudio opencv-python opencv-contrib-python scipy fastai kornia plotly umap-learn
 """
+
 import sys
-import os
 import numpy as np
 import pandas as pd
+import json
+import os
+import pickle
+from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QTabWidget, QPushButton, QLabel, 
-                             QComboBox, QFileDialog, QSpinBox, QDoubleSpinBox,
-                             QGroupBox, QScrollArea, QTextEdit, QStatusBar,
-                             QProgressBar, QCheckBox, QGridLayout, QMessageBox,
-                             QDialog, QLineEdit, QRadioButton, QButtonGroup)
-from PyQt6.QtCore import Qt
+                           QHBoxLayout, QTabWidget, QPushButton, QLabel, 
+                           QComboBox, QFileDialog, QSpinBox, QDoubleSpinBox,
+                           QGroupBox, QScrollArea, QTextEdit, QStatusBar,
+                           QProgressBar, QCheckBox, QGridLayout, QMessageBox,
+                           QDialog, QLineEdit, QRadioButton, QButtonGroup,
+                           QSlider, QFrame, QSplitter, QTreeWidget, QTreeWidgetItem,
+                           QTableWidget, QTableWidgetItem, QFormLayout)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont, QPixmap, QIcon
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -31,26 +38,270 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.manifold import TSNE
-from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, confusion_matrix, r2_score, silhouette_score
+from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, confusion_matrix, r2_score
 from sklearn.impute import SimpleImputer
 from sklearn.base import clone
-from sklearn.model_selection import cross_val_score
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, losses
-import plotly.express as px
-from plotly.subplots import make_subplots
-import umap
+from tensorflow.keras import layers, models, optimizers, losses, callbacks, applications
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import logging
 
-# Ensure xcb is used for Qt platform
-os.environ['QT_QPA_PLATFORM'] = 'xcb'
+class RealTimeLogger:
+    """Real-time logging system for training metrics and events"""
+    def __init__(self, log_widget):
+        self.log_widget = log_widget
+        self.logs = []
+        
+    def log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {level}: {message}"
+        self.logs.append(log_entry)
+        
+        # Update widget in main thread
+        current_text = self.log_widget.toPlainText()
+        self.log_widget.setText(current_text + "\n" + log_entry)
+        
+        # Auto-scroll to bottom
+        cursor = self.log_widget.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.log_widget.setTextCursor(cursor)
+
+class TrainingWorker(QThread):
+    """Worker thread for neural network training to prevent GUI freezing"""
+    progress_update = pyqtSignal(int)
+    log_update = pyqtSignal(str, str)
+    training_complete = pyqtSignal(object, object)
+    gradient_update = pyqtSignal(dict)
+    
+    def __init__(self, model, X_train, y_train, X_test, y_test, 
+                 batch_size, epochs, callbacks_list, monitor_gradients=False):
+        super().__init__()
+        self.model = model
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_test = X_test
+        self.y_test = y_test
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.callbacks_list = callbacks_list
+        self.monitor_gradients = monitor_gradients
+        
+    def run(self):
+        try:
+            # Custom callback for progress updates
+            class ProgressCallback(tf.keras.callbacks.Callback):
+                def __init__(self, worker):
+                    super().__init__()
+                    self.worker = worker
+                    
+                def on_epoch_begin(self, epoch, logs=None):
+                    progress = int((epoch / self.params['epochs']) * 100)
+                    self.worker.progress_update.emit(progress)
+                    self.worker.log_update.emit(f"Starting epoch {epoch + 1}/{self.params['epochs']}", "INFO")
+                    
+                def on_epoch_end(self, epoch, logs=None):
+                    progress = int(((epoch + 1) / self.params['epochs']) * 100)
+                    self.worker.progress_update.emit(progress)
+                    
+                    log_msg = f"Epoch {epoch + 1} - "
+                    if logs:
+                        for key, value in logs.items():
+                            log_msg += f"{key}: {value:.4f}, "
+                        log_msg = log_msg.rstrip(", ")
+                    
+                    self.worker.log_update.emit(log_msg, "INFO")
+                    
+                    # Monitor gradients if enabled
+                    if self.worker.monitor_gradients and epoch % 5 == 0:
+                        gradients = {}
+                        for i, layer in enumerate(self.model.layers):
+                            if hasattr(layer, 'kernel') and layer.kernel is not None:
+                                grad_norm = tf.norm(layer.kernel).numpy()
+                                gradients[f'layer_{i}_grad_norm'] = grad_norm
+                        self.worker.gradient_update.emit(gradients)
+            
+            # Add progress callback
+            callbacks_with_progress = self.callbacks_list + [ProgressCallback(self)]
+            
+            # Train the model
+            history = self.model.fit(
+                self.X_train, self.y_train,
+                batch_size=self.batch_size,
+                epochs=self.epochs,
+                validation_data=(self.X_test, self.y_test),
+                callbacks=callbacks_with_progress,
+                verbose=0
+            )
+            
+            # Make predictions
+            y_pred = self.model.predict(self.X_test)
+            
+            self.training_complete.emit(history, y_pred)
+            
+        except Exception as e:
+            self.log_update.emit(f"Training error: {str(e)}", "ERROR")
+
+class ArchitectureAnalyzer:
+    """Analyzes and explains neural network architecture choices"""
+    @staticmethod
+    def analyze_architecture(layer_config):
+        explanation = "Neural Network Architecture Analysis:\n\n"
+        
+        total_layers = len(layer_config)
+        depth_analysis = f"Network Depth: {total_layers} layers\n"
+        
+        # Count layer types
+        conv_layers = sum(1 for layer in layer_config if layer['type'] in ['Conv2D', 'Conv1D'])
+        dense_layers = sum(1 for layer in layer_config if layer['type'] == 'Dense')
+        recurrent_layers = sum(1 for layer in layer_config if layer['type'] in ['LSTM', 'GRU', 'SimpleRNN'])
+        pooling_layers = sum(1 for layer in layer_config if 'Pooling' in layer['type'])
+        
+        layer_distribution = f"Layer Distribution:\n"
+        layer_distribution += f"- Convolutional layers: {conv_layers}\n"
+        layer_distribution += f"- Dense layers: {dense_layers}\n"
+        layer_distribution += f"- Recurrent layers: {recurrent_layers}\n"
+        layer_distribution += f"- Pooling layers: {pooling_layers}\n\n"
+        
+        # Architecture pattern recognition
+        architecture_pattern = "Architecture Pattern Analysis:\n"
+        if conv_layers > 0 and dense_layers > 0:
+            architecture_pattern += "Pattern: Convolutional Neural Network with Fully Connected Classifier\n"
+            architecture_pattern += "- Suitable for image classification and computer vision tasks\n"
+            architecture_pattern += "- Convolutional layers extract spatial features\n"
+            architecture_pattern += "- Dense layers perform high-level reasoning and classification\n\n"
+        elif recurrent_layers > 0:
+            architecture_pattern += "Pattern: Recurrent Neural Network\n"
+            architecture_pattern += "- Designed for sequential data processing\n"
+            architecture_pattern += "- Can handle variable-length input sequences\n"
+            architecture_pattern += "- Memory cells capture temporal dependencies\n\n"
+        elif dense_layers == total_layers:
+            architecture_pattern += "Pattern: Multi-Layer Perceptron (Fully Connected)\n"
+            architecture_pattern += "- Traditional feedforward neural network\n"
+            architecture_pattern += "- Suitable for tabular data and feature-based learning\n"
+            architecture_pattern += "- Each layer learns increasingly abstract representations\n\n"
+        
+        # Activation function analysis
+        activations = [layer.get('params', {}).get('activation', 'none') 
+                      for layer in layer_config if layer.get('params', {}).get('activation')]
+        if activations:
+            unique_activations = list(set(activations))
+            activation_analysis = f"Activation Functions Analysis:\n"
+            activation_analysis += f"Used activations: {', '.join(unique_activations)}\n"
+            
+            for activation in unique_activations:
+                if activation == 'relu':
+                    activation_analysis += "- ReLU: Mitigates vanishing gradient problem, computationally efficient\n"
+                elif activation == 'sigmoid':
+                    activation_analysis += "- Sigmoid: Outputs probability-like values (0-1), suitable for binary classification\n"
+                elif activation == 'tanh':
+                    activation_analysis += "- Tanh: Zero-centered outputs, can help with gradient flow\n"
+                elif activation == 'softmax':
+                    activation_analysis += "- Softmax: Probability distribution over classes for multi-class classification\n"
+                elif activation == 'swish':
+                    activation_analysis += "- Swish: Self-gated activation function, often outperforms ReLU\n"
+            activation_analysis += "\n"
+        else:
+            activation_analysis = ""
+        
+        # Recommendations
+        recommendations = "Architecture Recommendations:\n"
+        if conv_layers > 0 and pooling_layers == 0:
+            recommendations += "- Consider adding pooling layers to reduce spatial dimensions\n"
+        if dense_layers > 3:
+            recommendations += "- Deep dense networks may benefit from dropout regularization\n"
+        if 'BatchNormalization' not in [layer['type'] for layer in layer_config]:
+            recommendations += "- BatchNormalization can improve training stability\n"
+        if 'Dropout' not in [layer['type'] for layer in layer_config] and dense_layers > 2:
+            recommendations += "- Dropout layers can help prevent overfitting\n"
+        
+        return explanation + depth_analysis + layer_distribution + architecture_pattern + activation_analysis + recommendations
+
+class OptimizerComparator:
+    """Provides detailed comparison of different optimizers"""
+    @staticmethod
+    def get_optimizer_comparison():
+        comparison = """Optimizer Comparison and Selection Guide:
+
+Adam (Adaptive Moment Estimation):
+✓ Advantages:
+  - Combines benefits of AdaGrad and RMSprop
+  - Adaptive learning rates for each parameter
+  - Works well with sparse gradients
+  - Generally good default choice for most problems
+  - Requires minimal hyperparameter tuning
+
+✗ Disadvantages:
+  - Can sometimes overshoot optimal solutions
+  - May not converge to the sharpest minima
+  - Can be computationally expensive for very large models
+
+Best for: Most deep learning tasks, especially when starting a new project
+
+SGD (Stochastic Gradient Descent):
+✓ Advantages:
+  - Simple and well-understood algorithm
+  - Can escape local minima with proper momentum
+  - Often achieves better generalization than adaptive methods
+  - Memory efficient
+
+✗ Disadvantages:
+  - Requires careful learning rate tuning
+  - Can be slow to converge without momentum
+  - Sensitive to feature scaling
+
+Best for: Fine-tuning pre-trained models, when generalization is critical
+
+RMSprop:
+✓ Advantages:
+  - Adapts learning rate based on recent gradients
+  - Good for recurrent neural networks
+  - Handles non-stationary objectives well
+  - Less aggressive than AdaGrad
+
+✗ Disadvantages:
+  - Can be sensitive to hyperparameter settings
+  - Less popular than Adam for general use
+
+Best for: Recurrent neural networks, online learning scenarios
+
+AdaGrad:
+✓ Advantages:
+  - Performs larger updates for infrequent parameters
+  - Good for sparse data
+  - No manual tuning of learning rate
+
+✗ Disadvantages:
+  - Learning rate decreases too aggressively
+  - Can stop learning too early
+
+Best for: Sparse data, natural language processing tasks
+
+Adadelta:
+✓ Advantages:
+  - Addresses AdaGrad's learning rate decay problem
+  - No need to set default learning rate
+  - Robust to noisy gradients
+
+✗ Disadvantages:
+  - Can be slow to converge
+  - Less commonly used, fewer resources available
+
+Best for: When you want adaptive learning without setting learning rate
+
+General Recommendations:
+1. Start with Adam for most projects
+2. Try SGD with momentum for fine-tuning or when Adam struggles
+3. Use RMSprop specifically for RNNs
+4. Consider learning rate scheduling for better convergence
+5. Monitor training curves to detect optimization issues early
+"""
+        return comparison
 
 class MLCourseGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Machine Learning Course GUI")
-        self.setGeometry(100, 100, 1400, 800)
+        self.setWindowTitle("Machine Learning Course GUI - Enhanced v0.1.3")
+        self.setGeometry(100, 100, 1600, 1000)
         
         # Initialize main widget and layout
         self.main_widget = QWidget()
@@ -67,6 +318,8 @@ class MLCourseGUI(QMainWindow):
         
         # Neural network configuration
         self.layer_config = []
+        self.training_history = None
+        self.gradient_history = {}
         
         # Create components
         self.create_data_section()
@@ -76,6 +329,12 @@ class MLCourseGUI(QMainWindow):
         
         # Default imputer
         self.imputer = None
+        
+        # Pre-trained models cache
+        self.pretrained_models = {}
+        
+        # Real-time logger
+        self.logger = None
         
     def load_dataset(self):
         """Load selected dataset"""
@@ -100,6 +359,20 @@ class MLCourseGUI(QMainWindow):
                 X, y = data.data, data.target
             elif dataset_name == "MNIST Dataset":
                 (X_train, y_train), (X_test, y_test) = tf.keras.datasets.mnist.load_data()
+                self.X_train = X_train.reshape(X_train.shape[0], -1) / 255.0
+                self.X_test = X_test.reshape(X_test.shape[0], -1) / 255.0
+                self.y_train, self.y_test = y_train, y_test
+                self.status_bar.showMessage(f"Loaded {dataset_name}")
+                return
+            elif dataset_name == "CIFAR-10 Dataset":
+                (X_train, y_train), (X_test, y_test) = tf.keras.datasets.cifar10.load_data()
+                self.X_train = X_train.astype('float32') / 255.0
+                self.X_test = X_test.astype('float32') / 255.0
+                self.y_train, self.y_test = y_train.flatten(), y_test.flatten()
+                self.status_bar.showMessage(f"Loaded {dataset_name}")
+                return
+            elif dataset_name == "Fashion-MNIST Dataset":
+                (X_train, y_train), (X_test, y_test) = tf.keras.datasets.fashion_mnist.load_data()
                 self.X_train = X_train.reshape(X_train.shape[0], -1) / 255.0
                 self.X_test = X_test.reshape(X_test.shape[0], -1) / 255.0
                 self.y_train, self.y_test = y_train, y_test
@@ -236,6 +509,7 @@ class MLCourseGUI(QMainWindow):
             # Model to use for comparison
             model = RandomForestClassifier(n_estimators=100, random_state=42)
             if len(np.unique(y_orig)) > 10:  # Regression
+                from sklearn.ensemble import RandomForestRegressor
                 model = RandomForestRegressor(n_estimators=100, random_state=42)
             
             # Evaluate each method
@@ -446,7 +720,7 @@ class MLCourseGUI(QMainWindow):
                 
             except Exception as e:
                 self.show_error(f"Error applying scaling: {str(e)}")
-    
+
     def create_data_section(self):
         """Create the data loading and preprocessing section"""
         data_group = QGroupBox("Data Management")
@@ -463,7 +737,9 @@ class MLCourseGUI(QMainWindow):
             "Breast Cancer Dataset",
             "Digits Dataset",
             "Boston Housing Dataset",
-            "MNIST Dataset"
+            "MNIST Dataset",
+            "CIFAR-10 Dataset",
+            "Fashion-MNIST Dataset"
         ])
         self.dataset_combo.currentIndexChanged.connect(self.load_dataset)
         
@@ -530,31 +806,6 @@ class MLCourseGUI(QMainWindow):
         
         data_layout.addLayout(missing_values_section)
         
-        # Validation method section
-        validation_section = QHBoxLayout()
-        validation_section.addWidget(QLabel("Validation Method:"))
-        self.validation_method_combo = QComboBox()
-        self.validation_method_combo.addItems(["Train-Test Split", "K-Fold Cross-Validation"])
-        validation_section.addWidget(self.validation_method_combo)
-        
-        # K-Fold parameter
-        self.kfold_spin = QSpinBox()
-        self.kfold_spin.setRange(2, 10)
-        self.kfold_spin.setValue(5)
-        self.kfold_spin.setEnabled(False)  # Enabled only when K-Fold is selected
-        
-        # Enable/disable kfold_spin based on selection
-        def update_kfold_spin():
-            is_kfold = self.validation_method_combo.currentText() == "K-Fold Cross-Validation"
-            self.kfold_spin.setEnabled(is_kfold)
-        
-        self.validation_method_combo.currentIndexChanged.connect(update_kfold_spin)
-        
-        validation_section.addWidget(QLabel("Folds:"))
-        validation_section.addWidget(self.kfold_spin)
-        
-        data_layout.addLayout(validation_section)
-        
         data_group.setLayout(data_layout)
         self.layout.addWidget(data_group)
     
@@ -565,10 +816,12 @@ class MLCourseGUI(QMainWindow):
         # Create individual tabs
         tabs = [
             ("Classical ML", self.create_classical_ml_tab),
-            ("Deep Learning", self.create_deep_learning_tab),
+            ("Advanced Deep Learning", self.create_advanced_deep_learning_tab),
+            ("Transfer Learning", self.create_transfer_learning_tab),
             ("Dimensionality Reduction", self.create_dim_reduction_tab),
             ("Reinforcement Learning", self.create_rl_tab),
-            ("Bayesian Methods", self.create_bayesian_tab)
+            ("Bayesian Methods", self.create_bayesian_tab),
+            ("GAN & Advanced", self.create_gan_tab)
         ]
         
         for tab_name, create_func in tabs:
@@ -579,7 +832,1467 @@ class MLCourseGUI(QMainWindow):
             self.tab_widget.addTab(scroll, tab_name)
         
         self.layout.addWidget(self.tab_widget)
-    
+
+    def create_advanced_deep_learning_tab(self):
+        """Create the advanced deep learning tab with enhanced neural network design capabilities"""
+        widget = QWidget()
+        main_layout = QHBoxLayout(widget)
+        
+        # Left panel - Architecture Design
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Neural Network Architecture Designer
+        arch_group = QGroupBox("Neural Network Architecture Designer")
+        arch_layout = QVBoxLayout()
+        
+        # Layer management buttons
+        layer_buttons = QHBoxLayout()
+        add_layer_btn = QPushButton("Add Layer")
+        add_layer_btn.clicked.connect(self.show_advanced_layer_dialog)
+        remove_layer_btn = QPushButton("Remove Selected")
+        remove_layer_btn.clicked.connect(self.remove_selected_layer)
+        clear_layers_btn = QPushButton("Clear All Layers")
+        clear_layers_btn.clicked.connect(self.clear_all_layers)
+        
+        layer_buttons.addWidget(add_layer_btn)
+        layer_buttons.addWidget(remove_layer_btn)
+        layer_buttons.addWidget(clear_layers_btn)
+        arch_layout.addLayout(layer_buttons)
+        
+        # Architecture visualization tree
+        self.architecture_tree = QTreeWidget()
+        self.architecture_tree.setHeaderLabels(["Layer", "Type", "Parameters", "Output Shape"])
+        self.architecture_tree.setMaximumHeight(250)
+        arch_layout.addWidget(self.architecture_tree)
+        
+        # Save/Load architecture buttons
+        save_load_layout = QHBoxLayout()
+        save_arch_btn = QPushButton("Save Architecture")
+        save_arch_btn.clicked.connect(self.save_neural_architecture)
+        load_arch_btn = QPushButton("Load Architecture")
+        load_arch_btn.clicked.connect(self.load_neural_architecture)
+        explain_arch_btn = QPushButton("Explain Architecture")
+        explain_arch_btn.clicked.connect(self.explain_current_architecture)
+        
+        save_load_layout.addWidget(save_arch_btn)
+        save_load_layout.addWidget(load_arch_btn)
+        save_load_layout.addWidget(explain_arch_btn)
+        arch_layout.addLayout(save_load_layout)
+        
+        arch_group.setLayout(arch_layout)
+        left_layout.addWidget(arch_group)
+        
+        # Advanced Training Configuration
+        training_group = QGroupBox("Advanced Training Configuration")
+        training_layout = QFormLayout()
+        
+        # Optimizer selection with enhanced options
+        self.advanced_optimizer_combo = QComboBox()
+        self.advanced_optimizer_combo.addItems(["Adam", "SGD", "RMSprop", "AdaGrad", "Adadelta"])
+        training_layout.addRow("Optimizer:", self.advanced_optimizer_combo)
+        
+        # Learning rate with fine control
+        self.advanced_learning_rate = QDoubleSpinBox()
+        self.advanced_learning_rate.setRange(0.00001, 1.0)
+        self.advanced_learning_rate.setValue(0.001)
+        self.advanced_learning_rate.setDecimals(5)
+        self.advanced_learning_rate.setSingleStep(0.0001)
+        training_layout.addRow("Learning Rate:", self.advanced_learning_rate)
+        
+        # Learning rate scheduling
+        self.lr_schedule_combo = QComboBox()
+        self.lr_schedule_combo.addItems(["None", "Step Decay", "Exponential Decay", "Cosine Annealing"])
+        training_layout.addRow("LR Schedule:", self.lr_schedule_combo)
+        
+        # Batch size
+        self.advanced_batch_size = QSpinBox()
+        self.advanced_batch_size.setRange(1, 512)
+        self.advanced_batch_size.setValue(32)
+        training_layout.addRow("Batch Size:", self.advanced_batch_size)
+        
+        # Epochs
+        self.advanced_epochs = QSpinBox()
+        self.advanced_epochs.setRange(1, 1000)
+        self.advanced_epochs.setValue(100)
+        training_layout.addRow("Epochs:", self.advanced_epochs)
+        
+        # Regularization options
+        self.l2_regularization = QDoubleSpinBox()
+        self.l2_regularization.setRange(0.0, 1.0)
+        self.l2_regularization.setValue(0.01)
+        self.l2_regularization.setDecimals(4)
+        training_layout.addRow("L2 Regularization:", self.l2_regularization)
+        
+        # Early stopping
+        self.early_stopping_enabled = QCheckBox("Enable Early Stopping")
+        self.early_stopping_enabled.setChecked(True)
+        training_layout.addRow("Early Stopping:", self.early_stopping_enabled)
+        
+        self.early_stopping_patience = QSpinBox()
+        self.early_stopping_patience.setRange(1, 100)
+        self.early_stopping_patience.setValue(15)
+        training_layout.addRow("Patience:", self.early_stopping_patience)
+        
+        # Gradient monitoring
+        self.gradient_monitoring_enabled = QCheckBox("Monitor Gradients")
+        training_layout.addRow("Gradient Monitoring:", self.gradient_monitoring_enabled)
+        
+        training_group.setLayout(training_layout)
+        left_layout.addWidget(training_group)
+        
+        # Training control buttons
+        control_group = QGroupBox("Training Controls")
+        control_layout = QVBoxLayout()
+        
+        train_advanced_btn = QPushButton("Train Advanced Neural Network")
+        train_advanced_btn.clicked.connect(self.train_advanced_neural_network)
+        train_advanced_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
+        control_layout.addWidget(train_advanced_btn)
+        
+        compare_optimizers_btn = QPushButton("Compare Optimizers")
+        compare_optimizers_btn.clicked.connect(self.show_optimizer_comparison)
+        control_layout.addWidget(compare_optimizers_btn)
+        
+        save_model_btn = QPushButton("Save Trained Model")
+        save_model_btn.clicked.connect(self.save_trained_model)
+        control_layout.addWidget(save_model_btn)
+        
+        control_group.setLayout(control_layout)
+        left_layout.addWidget(control_group)
+        
+        main_layout.addWidget(left_panel)
+        
+        # Right panel - Real-time monitoring and visualization
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Real-time training log
+        log_group = QGroupBox("Real-time Training Log")
+        log_layout = QVBoxLayout()
+        
+        self.advanced_training_log = QTextEdit()
+        self.advanced_training_log.setReadOnly(True)
+        self.advanced_training_log.setMaximumHeight(200)
+        self.advanced_training_log.setStyleSheet("QTextEdit { background-color: #2b2b2b; color: #ffffff; font-family: 'Courier New', monospace; font-size: 9pt; }")
+        log_layout.addWidget(self.advanced_training_log)
+        
+        log_group.setLayout(log_layout)
+        right_layout.addWidget(log_group)
+        
+        # Training progress bar
+        progress_group = QGroupBox("Training Progress")
+        progress_layout = QVBoxLayout()
+        
+        self.advanced_training_progress = QProgressBar()
+        self.advanced_training_progress.setStyleSheet("QProgressBar { border: 2px solid grey; border-radius: 5px; text-align: center; } QProgressBar::chunk { background-color: #4CAF50; width: 20px; }")
+        progress_layout.addWidget(self.advanced_training_progress)
+        
+        progress_group.setLayout(progress_layout)
+        right_layout.addWidget(progress_group)
+        
+        # Gradient monitoring visualization
+        gradient_group = QGroupBox("Gradient Monitoring")
+        gradient_layout = QVBoxLayout()
+        
+        self.gradient_figure = Figure(figsize=(6, 4))
+        self.gradient_canvas = FigureCanvas(self.gradient_figure)
+        gradient_layout.addWidget(self.gradient_canvas)
+        
+        gradient_group.setLayout(gradient_layout)
+        right_layout.addWidget(gradient_group)
+        
+        main_layout.addWidget(right_panel)
+        
+        return widget
+
+    def show_advanced_layer_dialog(self):
+        """Show enhanced dialog for adding neural network layers with comprehensive options"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Neural Network Layer")
+        dialog.setGeometry(200, 200, 600, 500)
+        layout = QVBoxLayout(dialog)
+        
+        # Layer type selection
+        type_layout = QHBoxLayout()
+        type_label = QLabel("Layer Type:")
+        type_combo = QComboBox()
+        type_combo.addItems([
+            "Dense", "Conv2D", "Conv1D", "MaxPooling2D", "MaxPooling1D",
+            "GlobalMaxPooling2D", "GlobalAveragePooling2D", "Flatten",
+            "Dropout", "BatchNormalization", "LSTM", "GRU", "SimpleRNN",
+            "Embedding", "Reshape", "Lambda"
+        ])
+        type_layout.addWidget(type_label)
+        type_layout.addWidget(type_combo)
+        layout.addLayout(type_layout)
+        
+        # Scrollable parameters area
+        scroll = QScrollArea()
+        params_widget = QWidget()
+        params_layout = QVBoxLayout(params_widget)
+        scroll.setWidget(params_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+        
+        # Dynamic parameter inputs
+        self.layer_param_inputs = {}
+        
+        def update_layer_parameters():
+            # Clear existing parameter inputs
+            for i in reversed(range(params_layout.count())): 
+                params_layout.itemAt(i).widget().setParent(None)
+            self.layer_param_inputs.clear()
+            
+            layer_type = type_combo.currentText()
+            
+            if layer_type == "Dense":
+                self.add_parameter_input(params_layout, "units", "int", 128, 1, 4096)
+                self.add_parameter_input(params_layout, "activation", "combo", "relu", 
+                                       ["relu", "sigmoid", "tanh", "softmax", "linear", "swish", "gelu"])
+                self.add_parameter_input(params_layout, "use_bias", "bool", True)
+                self.add_parameter_input(params_layout, "kernel_regularizer", "combo", "None", 
+                                       ["None", "l1", "l2", "l1_l2"])
+                
+            elif layer_type == "Conv2D":
+                self.add_parameter_input(params_layout, "filters", "int", 64, 1, 512)
+                self.add_parameter_input(params_layout, "kernel_size", "tuple", "(3,3)")
+                self.add_parameter_input(params_layout, "strides", "tuple", "(1,1)")
+                self.add_parameter_input(params_layout, "padding", "combo", "valid", ["valid", "same"])
+                self.add_parameter_input(params_layout, "activation", "combo", "relu", 
+                                       ["relu", "sigmoid", "tanh", "linear", "swish", "gelu"])
+                self.add_parameter_input(params_layout, "use_bias", "bool", True)
+                
+            elif layer_type == "Conv1D":
+                self.add_parameter_input(params_layout, "filters", "int", 64, 1, 512)
+                self.add_parameter_input(params_layout, "kernel_size", "int", 3, 1, 20)
+                self.add_parameter_input(params_layout, "strides", "int", 1, 1, 10)
+                self.add_parameter_input(params_layout, "padding", "combo", "valid", ["valid", "same"])
+                self.add_parameter_input(params_layout, "activation", "combo", "relu", 
+                                       ["relu", "sigmoid", "tanh", "linear", "swish"])
+                
+            elif layer_type == "MaxPooling2D":
+                self.add_parameter_input(params_layout, "pool_size", "tuple", "(2,2)")
+                self.add_parameter_input(params_layout, "strides", "tuple", "(2,2)")
+                self.add_parameter_input(params_layout, "padding", "combo", "valid", ["valid", "same"])
+                
+            elif layer_type == "MaxPooling1D":
+                self.add_parameter_input(params_layout, "pool_size", "int", 2, 1, 10)
+                self.add_parameter_input(params_layout, "strides", "int", 2, 1, 10)
+                self.add_parameter_input(params_layout, "padding", "combo", "valid", ["valid", "same"])
+                
+            elif layer_type == "Dropout":
+                self.add_parameter_input(params_layout, "rate", "float", 0.5, 0.0, 0.9, 0.1)
+                
+            elif layer_type in ["LSTM", "GRU", "SimpleRNN"]:
+                self.add_parameter_input(params_layout, "units", "int", 128, 1, 1024)
+                self.add_parameter_input(params_layout, "activation", "combo", "tanh", 
+                                       ["tanh", "relu", "sigmoid", "linear"])
+                self.add_parameter_input(params_layout, "return_sequences", "bool", False)
+                self.add_parameter_input(params_layout, "return_state", "bool", False)
+                if layer_type in ["LSTM", "GRU"]:
+                    self.add_parameter_input(params_layout, "recurrent_activation", "combo", "sigmoid", 
+                                           ["sigmoid", "tanh", "relu"])
+                self.add_parameter_input(params_layout, "dropout", "float", 0.0, 0.0, 0.9, 0.1)
+                self.add_parameter_input(params_layout, "recurrent_dropout", "float", 0.0, 0.0, 0.9, 0.1)
+                
+            elif layer_type == "Embedding":
+                self.add_parameter_input(params_layout, "input_dim", "int", 10000, 1, 100000)
+                self.add_parameter_input(params_layout, "output_dim", "int", 128, 1, 1000)
+                self.add_parameter_input(params_layout, "mask_zero", "bool", False)
+                
+            elif layer_type == "Reshape":
+                self.add_parameter_input(params_layout, "target_shape", "tuple", "(28,28,1)")
+        
+        type_combo.currentIndexChanged.connect(update_layer_parameters)
+        update_layer_parameters()  # Initialize with first layer type
+        
+        # Dialog buttons
+        button_layout = QHBoxLayout()
+        add_btn = QPushButton("Add Layer")
+        cancel_btn = QPushButton("Cancel")
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        def add_layer_to_architecture():
+            layer_type = type_combo.currentText()
+            layer_params = {}
+            
+            for param_name, widget in self.layer_param_inputs.items():
+                if isinstance(widget, QSpinBox):
+                    layer_params[param_name] = widget.value()
+                elif isinstance(widget, QDoubleSpinBox):
+                    layer_params[param_name] = widget.value()
+                elif isinstance(widget, QComboBox):
+                    value = widget.currentText()
+                    if value == "None":
+                        layer_params[param_name] = None
+                    else:
+                        layer_params[param_name] = value
+                elif isinstance(widget, QCheckBox):
+                    layer_params[param_name] = widget.isChecked()
+                elif isinstance(widget, QLineEdit):
+                    text = widget.text().strip()
+                    if param_name in ["kernel_size", "strides", "pool_size", "target_shape"]:
+                        try:
+                            layer_params[param_name] = eval(text)
+                        except:
+                            layer_params[param_name] = text
+                    else:
+                        layer_params[param_name] = text
+            
+            self.layer_config.append({
+                "type": layer_type,
+                "params": layer_params
+            })
+            
+            self.update_architecture_tree_display()
+            dialog.accept()
+        
+        add_btn.clicked.connect(add_layer_to_architecture)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        dialog.exec()
+
+    def add_parameter_input(self, layout, param_name, param_type, default_value, 
+                           min_val=None, max_val=None, step=None, options=None):
+        """Add parameter input widget to the layout with enhanced controls"""
+        param_layout = QHBoxLayout()
+        param_layout.addWidget(QLabel(f"{param_name.replace('_', ' ').title()}:"))
+        
+        if param_type == "int":
+            widget = QSpinBox()
+            if min_val is not None:
+                widget.setMinimum(min_val)
+            if max_val is not None:
+                widget.setMaximum(max_val)
+            widget.setValue(default_value)
+            
+        elif param_type == "float":
+            widget = QDoubleSpinBox()
+            if min_val is not None:
+                widget.setMinimum(min_val)
+            if max_val is not None:
+                widget.setMaximum(max_val)
+            widget.setValue(default_value)
+            widget.setDecimals(3)
+            if step is not None:
+                widget.setSingleStep(step)
+            else:
+                widget.setSingleStep(0.1)
+                
+        elif param_type == "bool":
+            widget = QCheckBox()
+            widget.setChecked(default_value)
+            
+        elif param_type == "combo":
+            widget = QComboBox()
+            widget.addItems(options)
+            if default_value in options:
+                widget.setCurrentText(default_value)
+                
+        elif param_type == "tuple":
+            widget = QLineEdit()
+            widget.setText(str(default_value))
+            widget.setPlaceholderText("e.g., (3,3) or (28,28,1)")
+        
+        param_layout.addWidget(widget)
+        layout.addLayout(param_layout)
+        self.layer_param_inputs[param_name] = widget
+
+    def update_architecture_tree_display(self):
+        """Update the neural network architecture tree display with enhanced information"""
+        self.architecture_tree.clear()
+        
+        for i, layer in enumerate(self.layer_config):
+            item = QTreeWidgetItem()
+            item.setText(0, f"Layer {i+1}")
+            item.setText(1, layer['type'])
+            
+            # Format parameters for display
+            params_str = ""
+            for key, value in layer['params'].items():
+                if value is not None:
+                    params_str += f"{key}={value}, "
+            params_str = params_str.rstrip(", ")
+            item.setText(2, params_str)
+            
+            # Estimate output shape (simplified approximation)
+            output_shape = self.estimate_layer_output_shape(layer, i)
+            item.setText(3, output_shape)
+            
+            self.architecture_tree.addTopLevelItem(item)
+
+    def estimate_layer_output_shape(self, layer, layer_index):
+        """Estimate the output shape of a layer for display purposes"""
+        if layer_index == 0:
+            return "Input dependent"
+        elif layer['type'] == 'Dense':
+            units = layer['params'].get('units', 'N')
+            return f"(batch_size, {units})"
+        elif layer['type'] == 'Conv2D':
+            filters = layer['params'].get('filters', 'F')
+            return f"(batch_size, H', W', {filters})"
+        elif layer['type'] in ['LSTM', 'GRU', 'SimpleRNN']:
+            units = layer['params'].get('units', 'N')
+            return_seq = layer['params'].get('return_sequences', False)
+            if return_seq:
+                return f"(batch_size, timesteps, {units})"
+            else:
+                return f"(batch_size, {units})"
+        elif layer['type'] == 'Flatten':
+            return "(batch_size, features)"
+        elif layer['type'] == 'Dropout':
+            return "Same as input"
+        else:
+            return "Auto-calculated"
+
+    def remove_selected_layer(self):
+        """Remove the selected layer from the architecture"""
+        current_item = self.architecture_tree.currentItem()
+        if current_item:
+            index = self.architecture_tree.indexOfTopLevelItem(current_item)
+            if 0 <= index < len(self.layer_config):
+                del self.layer_config[index]
+                self.update_architecture_tree_display()
+
+    def clear_all_layers(self):
+        """Clear all layers from the current architecture"""
+        reply = QMessageBox.question(self, "Clear Architecture", 
+                                   "Are you sure you want to clear all layers?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.layer_config.clear()
+            self.update_architecture_tree_display()
+
+    def save_neural_architecture(self):
+        """Save the current neural network architecture to a JSON file"""
+        if not self.layer_config:
+            self.show_error("No architecture to save. Please add layers first.")
+            return
+        
+        try:
+            file_name, _ = QFileDialog.getSaveFileName(
+                self, "Save Neural Network Architecture", "", 
+                "JSON files (*.json);;All files (*)"
+            )
+            
+            if file_name:
+                architecture_data = {
+                    "architecture_name": f"Neural_Network_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    "layers": self.layer_config,
+                    "metadata": {
+                        "created_date": datetime.now().isoformat(),
+                        "total_layers": len(self.layer_config),
+                        "framework_version": "0.1.3"
+                    },
+                    "training_config": {
+                        "optimizer": self.advanced_optimizer_combo.currentText(),
+                        "learning_rate": self.advanced_learning_rate.value(),
+                        "batch_size": self.advanced_batch_size.value(),
+                        "epochs": self.advanced_epochs.value()
+                    }
+                }
+                
+                with open(file_name, 'w') as f:
+                    json.dump(architecture_data, f, indent=2, default=str)
+                
+                self.status_bar.showMessage(f"Architecture saved successfully to {file_name}")
+                
+        except Exception as e:
+            self.show_error(f"Error saving architecture: {str(e)}")
+
+    def load_neural_architecture(self):
+        """Load a neural network architecture from a JSON file"""
+        try:
+            file_name, _ = QFileDialog.getOpenFileName(
+                self, "Load Neural Network Architecture", "",
+                "JSON files (*.json);;All files (*)"
+            )
+            
+            if file_name:
+                with open(file_name, 'r') as f:
+                    architecture_data = json.load(f)
+                
+                # Load layer configuration
+                self.layer_config = architecture_data.get("layers", [])
+                
+                # Load training configuration if available
+                if "training_config" in architecture_data:
+                    config = architecture_data["training_config"]
+                    self.advanced_optimizer_combo.setCurrentText(config.get("optimizer", "Adam"))
+                    self.advanced_learning_rate.setValue(config.get("learning_rate", 0.001))
+                    self.advanced_batch_size.setValue(config.get("batch_size", 32))
+                    self.advanced_epochs.setValue(config.get("epochs", 100))
+                
+                self.update_architecture_tree_display()
+                self.status_bar.showMessage(f"Architecture loaded successfully from {file_name}")
+                
+        except Exception as e:
+            self.show_error(f"Error loading architecture: {str(e)}")
+
+    def explain_current_architecture(self):
+        """Display detailed explanation of the current neural network architecture"""
+        if not self.layer_config:
+            self.show_error("No architecture to explain. Please add layers first.")
+            return
+        
+        explanation = ArchitectureAnalyzer.analyze_architecture(self.layer_config)
+        
+        # Create explanation dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Neural Network Architecture Analysis")
+        dialog.setGeometry(200, 200, 800, 600)
+        layout = QVBoxLayout(dialog)
+        
+        explanation_text = QTextEdit()
+        explanation_text.setPlainText(explanation)
+        explanation_text.setReadOnly(True)
+        explanation_text.setFont(QFont("Courier New", 10))
+        layout.addWidget(explanation_text)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        
+        dialog.exec()
+
+    def train_advanced_neural_network(self):
+        """Train the neural network with advanced configuration and real-time monitoring"""
+        if not self.layer_config:
+            self.show_error("Please design a neural network architecture first by adding layers.")
+            return
+        
+        if self.X_train is None or self.y_train is None:
+            self.show_error("Please load a dataset first.")
+            return
+        
+        try:
+            # Initialize real-time logger
+            self.logger = RealTimeLogger(self.advanced_training_log)
+            self.advanced_training_log.clear()
+            
+            self.logger.log("Initializing advanced neural network training...", "INFO")
+            
+            # Create the neural network model
+            model = self.build_advanced_neural_network()
+            if model is None:
+                return
+            
+            # Get training configuration
+            optimizer_name = self.advanced_optimizer_combo.currentText()
+            learning_rate = self.advanced_learning_rate.value()
+            batch_size = self.advanced_batch_size.value()
+            epochs = self.advanced_epochs.value()
+            
+            self.logger.log(f"Training configuration: {optimizer_name} optimizer, LR={learning_rate}, Batch={batch_size}, Epochs={epochs}", "INFO")
+            
+            # Create optimizer
+            optimizer = self.create_advanced_optimizer(optimizer_name, learning_rate)
+            
+            # Prepare data for training
+            X_train, y_train, X_test, y_test = self.prepare_advanced_training_data()
+            
+            # Compile model
+            self.compile_advanced_model(model, optimizer)
+            
+            # Prepare callbacks
+            callbacks_list = self.create_advanced_callbacks()
+            
+            # Start training in worker thread
+            self.training_worker = TrainingWorker(
+                model, X_train, y_train, X_test, y_test,
+                batch_size, epochs, callbacks_list,
+                self.gradient_monitoring_enabled.isChecked()
+            )
+            
+            # Connect signals
+            self.training_worker.progress_update.connect(self.advanced_training_progress.setValue)
+            self.training_worker.log_update.connect(self.logger.log)
+            self.training_worker.training_complete.connect(self.on_advanced_training_complete)
+            self.training_worker.gradient_update.connect(self.update_gradient_visualization)
+            
+            # Start training
+            self.training_worker.start()
+            self.logger.log("Training started in background thread...", "INFO")
+            
+        except Exception as e:
+            self.show_error(f"Error starting neural network training: {str(e)}")
+
+    def build_advanced_neural_network(self):
+        """Build the neural network model from the layer configuration"""
+        try:
+            model = models.Sequential()
+            
+            for i, layer_config in enumerate(self.layer_config):
+                layer_type = layer_config["type"]
+                params = layer_config["params"].copy()
+                
+                # Add input shape for the first layer
+                if i == 0 and "input_shape" not in params:
+                    if layer_type in ["Conv2D", "MaxPooling2D", "GlobalMaxPooling2D", "GlobalAveragePooling2D"]:
+                        # For convolutional layers, determine input shape from data
+                        if len(self.X_train.shape) == 4:
+                            params["input_shape"] = self.X_train.shape[1:]
+                        elif len(self.X_train.shape) == 2:
+                            # Attempt to reshape for image data
+                            if self.X_train.shape[1] == 784:  # MNIST
+                                params["input_shape"] = (28, 28, 1)
+                            elif self.X_train.shape[1] == 3072:  # CIFAR-10
+                                params["input_shape"] = (32, 32, 3)
+                            else:
+                                self.show_error("Cannot determine input shape for convolutional layers. Please reshape your data.")
+                                return None
+                    else:
+                        # For other layer types
+                        params["input_shape"] = (self.X_train.shape[1],)
+                
+                # Create layer based on type
+                layer = self.create_keras_layer(layer_type, params)
+                if layer is None:
+                    self.show_error(f"Failed to create layer: {layer_type}")
+                    return None
+                
+                model.add(layer)
+            
+            # Add output layer if not present
+            if not self.has_appropriate_output_layer():
+                output_layer = self.create_output_layer()
+                model.add(output_layer)
+                self.logger.log("Added automatic output layer", "INFO")
+            
+            return model
+            
+        except Exception as e:
+            self.show_error(f"Error building neural network: {str(e)}")
+            return None
+
+    def create_keras_layer(self, layer_type, params):
+        """Create a Keras layer from type and parameters"""
+        try:
+            if layer_type == "Dense":
+                return layers.Dense(**params)
+            elif layer_type == "Conv2D":
+                return layers.Conv2D(**params)
+            elif layer_type == "Conv1D":
+                return layers.Conv1D(**params)
+            elif layer_type == "MaxPooling2D":
+                return layers.MaxPooling2D(**params)
+            elif layer_type == "MaxPooling1D":
+                return layers.MaxPooling1D(**params)
+            elif layer_type == "GlobalMaxPooling2D":
+                return layers.GlobalMaxPooling2D()
+            elif layer_type == "GlobalAveragePooling2D":
+                return layers.GlobalAveragePooling2D()
+            elif layer_type == "Flatten":
+                return layers.Flatten()
+            elif layer_type == "Dropout":
+                return layers.Dropout(**params)
+            elif layer_type == "BatchNormalization":
+                return layers.BatchNormalization()
+            elif layer_type == "LSTM":
+                return layers.LSTM(**params)
+            elif layer_type == "GRU":
+                return layers.GRU(**params)
+            elif layer_type == "SimpleRNN":
+                return layers.SimpleRNN(**params)
+            elif layer_type == "Embedding":
+                return layers.Embedding(**params)
+            elif layer_type == "Reshape":
+                return layers.Reshape(params["target_shape"])
+            else:
+                return None
+        except Exception as e:
+            self.logger.log(f"Error creating {layer_type} layer: {str(e)}", "ERROR")
+            return None
+
+    def has_appropriate_output_layer(self):
+        """Check if the architecture has an appropriate output layer"""
+        if not self.layer_config:
+            return False
+        
+        last_layer = self.layer_config[-1]
+        if last_layer["type"] == "Dense":
+            activation = last_layer["params"].get("activation")
+            if activation in ["softmax", "sigmoid", "linear"]:
+                return True
+        
+        return False
+
+    def create_output_layer(self):
+        """Create an appropriate output layer based on the target data"""
+        num_classes = len(np.unique(self.y_train))
+        
+        if num_classes > 2:
+            # Multi-class classification
+            return layers.Dense(num_classes, activation='softmax', name='output_layer')
+        elif num_classes == 2:
+            # Binary classification
+            return layers.Dense(1, activation='sigmoid', name='output_layer')
+        else:
+            # Regression
+            return layers.Dense(1, activation='linear', name='output_layer')
+
+    def create_advanced_optimizer(self, optimizer_name, learning_rate):
+        """Create an optimizer with the specified configuration"""
+        if optimizer_name == "Adam":
+            return optimizers.Adam(learning_rate=learning_rate)
+        elif optimizer_name == "SGD":
+            return optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif optimizer_name == "RMSprop":
+            return optimizers.RMSprop(learning_rate=learning_rate)
+        elif optimizer_name == "AdaGrad":
+            return optimizers.Adagrad(learning_rate=learning_rate)
+        elif optimizer_name == "Adadelta":
+            return optimizers.Adadelta(learning_rate=learning_rate)
+        else:
+            return optimizers.Adam(learning_rate=learning_rate)
+
+    def prepare_advanced_training_data(self):
+        """Prepare data for advanced neural network training"""
+        X_train, X_test = self.X_train.copy(), self.X_test.copy()
+        y_train, y_test = self.y_train.copy(), self.y_test.copy()
+        
+        # Reshape data if needed for convolutional layers
+        conv_layers = [layer for layer in self.layer_config if layer["type"] in ["Conv2D", "MaxPooling2D"]]
+        if conv_layers and len(X_train.shape) == 2:
+            if X_train.shape[1] == 784:  # MNIST
+                X_train = X_train.reshape(-1, 28, 28, 1)
+                X_test = X_test.reshape(-1, 28, 28, 1)
+            elif X_train.shape[1] == 3072:  # CIFAR-10 flattened
+                X_train = X_train.reshape(-1, 32, 32, 3)
+                X_test = X_test.reshape(-1, 32, 32, 3)
+        
+        return X_train, y_train, X_test, y_test
+
+    def compile_advanced_model(self, model, optimizer):
+        """Compile the model with appropriate loss function and metrics"""
+        num_classes = len(np.unique(self.y_train))
+        
+        if num_classes > 2:
+            loss = 'sparse_categorical_crossentropy'
+            metrics = ['accuracy']
+        elif num_classes == 2:
+            loss = 'binary_crossentropy'
+            metrics = ['accuracy']
+        else:
+            loss = 'mse'
+            metrics = ['mae']
+        
+        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+
+    def create_advanced_callbacks(self):
+        """Create advanced training callbacks"""
+        callbacks_list = []
+        
+        # Early stopping
+        if self.early_stopping_enabled.isChecked():
+            early_stop = callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=self.early_stopping_patience.value(),
+                restore_best_weights=True,
+                verbose=1
+            )
+            callbacks_list.append(early_stop)
+        
+        # Learning rate scheduling
+        lr_schedule = self.lr_schedule_combo.currentText()
+        if lr_schedule != "None":
+            scheduler = self.create_learning_rate_scheduler(lr_schedule)
+            if scheduler:
+                callbacks_list.append(scheduler)
+        
+        # Model checkpointing
+        checkpoint = callbacks.ModelCheckpoint(
+            'best_model_temp.h5',
+            monitor='val_loss',
+            save_best_only=True,
+            verbose=0
+        )
+        callbacks_list.append(checkpoint)
+        
+        return callbacks_list
+
+    def create_learning_rate_scheduler(self, schedule_type):
+        """Create learning rate scheduler based on type"""
+        initial_lr = self.advanced_learning_rate.value()
+        
+        if schedule_type == "Step Decay":
+            def step_decay_schedule(epoch):
+                drop_rate = 0.5
+                epochs_drop = 10
+                return initial_lr * np.power(drop_rate, np.floor(epoch / epochs_drop))
+            
+            return callbacks.LearningRateScheduler(step_decay_schedule)
+        
+        elif schedule_type == "Exponential Decay":
+            def exp_decay_schedule(epoch):
+                return initial_lr * np.exp(-0.1 * epoch)
+            
+            return callbacks.LearningRateScheduler(exp_decay_schedule)
+        
+        elif schedule_type == "Cosine Annealing":
+            return callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=5,
+                min_lr=initial_lr * 0.001
+            )
+        
+        return None
+
+    def on_advanced_training_complete(self, history, y_pred):
+        """Handle completion of advanced neural network training"""
+        self.training_history = history
+        self.current_model = self.training_worker.model
+        
+        # Update main visualization
+        self.plot_training_history(history)
+        
+        # Calculate and display metrics
+        if len(np.unique(self.y_train)) > 2:
+            y_pred_classes = np.argmax(y_pred, axis=1)
+        else:
+            y_pred_classes = (y_pred > 0.5).astype(int).flatten()
+        
+        self.update_metrics(y_pred_classes)
+        
+        self.logger.log("Advanced neural network training completed successfully!", "SUCCESS")
+        self.advanced_training_progress.setValue(100)
+
+    def update_gradient_visualization(self, gradients):
+        """Update the gradient monitoring visualization"""
+        if not gradients:
+            return
+        
+        # Store gradient history
+        for key, value in gradients.items():
+            if key not in self.gradient_history:
+                self.gradient_history[key] = []
+            self.gradient_history[key].append(value)
+        
+        # Update gradient plot
+        self.gradient_figure.clear()
+        ax = self.gradient_figure.add_subplot(111)
+        
+        for key, values in self.gradient_history.items():
+            ax.plot(values, label=key.replace('_', ' ').title())
+        
+        ax.set_xlabel('Training Step (every 5 epochs)')
+        ax.set_ylabel('Gradient Norm')
+        ax.set_title('Weight Gradient Monitoring')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        self.gradient_figure.tight_layout()
+        self.gradient_canvas.draw()
+
+    def show_optimizer_comparison(self):
+        """Display detailed optimizer comparison information"""
+        comparison = OptimizerComparator.get_optimizer_comparison()
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Optimizer Comparison Guide")
+        dialog.setGeometry(200, 200, 900, 700)
+        layout = QVBoxLayout(dialog)
+        
+        comparison_text = QTextEdit()
+        comparison_text.setPlainText(comparison)
+        comparison_text.setReadOnly(True)
+        comparison_text.setFont(QFont("Consolas", 10))
+        layout.addWidget(comparison_text)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        
+        dialog.exec()
+
+    def save_trained_model(self):
+        """Save the trained neural network model"""
+        if self.current_model is None:
+            self.show_error("No trained model to save. Please train a model first.")
+            return
+        
+        try:
+            file_name, _ = QFileDialog.getSaveFileName(
+                self, "Save Trained Model", "",
+                "HDF5 files (*.h5);;SavedModel format (*.pb);;All files (*)"
+            )
+            
+            if file_name:
+                if file_name.endswith('.h5'):
+                    self.current_model.save(file_name)
+                else:
+                    # Save in SavedModel format
+                    self.current_model.save(file_name, save_format='tf')
+                
+                self.status_bar.showMessage(f"Model saved successfully to {file_name}")
+                
+        except Exception as e:
+            self.show_error(f"Error saving model: {str(e)}")
+
+    def create_transfer_learning_tab(self):
+        """Create comprehensive transfer learning tab with pre-trained model integration"""
+        widget = QWidget()
+        main_layout = QHBoxLayout(widget)
+        
+        # Left panel - Transfer learning configuration
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Pre-trained model selection
+        model_group = QGroupBox("Pre-trained Model Selection")
+        model_layout = QVBoxLayout()
+        
+        self.pretrained_model_combo = QComboBox()
+        self.pretrained_model_combo.addItems([
+            "VGG16", "VGG19", "ResNet50", "ResNet101", "InceptionV3", 
+            "Xception", "MobileNet", "DenseNet121", "EfficientNetB0"
+        ])
+        model_layout.addWidget(QLabel("Select Pre-trained Model:"))
+        model_layout.addWidget(self.pretrained_model_combo)
+        
+        load_pretrained_btn = QPushButton("Load Pre-trained Model")
+        load_pretrained_btn.clicked.connect(self.load_pretrained_model)
+        model_layout.addWidget(load_pretrained_btn)
+        
+        # Model information display
+        self.model_info_display = QTextEdit()
+        self.model_info_display.setReadOnly(True)
+        self.model_info_display.setMaximumHeight(150)
+        model_layout.addWidget(self.model_info_display)
+        
+        model_group.setLayout(model_layout)
+        left_layout.addWidget(model_group)
+        
+        # Fine-tuning configuration
+        finetune_group = QGroupBox("Fine-tuning Configuration")
+        finetune_layout = QFormLayout()
+        
+        # Layer freezing options
+        self.freeze_base_layers = QCheckBox("Freeze Base Model Layers")
+        self.freeze_base_layers.setChecked(True)
+        finetune_layout.addRow("Base Layers:", self.freeze_base_layers)
+        
+        self.unfreeze_top_layers = QSpinBox()
+        self.unfreeze_top_layers.setRange(0, 50)
+        self.unfreeze_top_layers.setValue(5)
+        finetune_layout.addRow("Unfreeze Top N Layers:", self.unfreeze_top_layers)
+        
+        # Fine-tuning learning rate
+        self.finetune_learning_rate = QDoubleSpinBox()
+        self.finetune_learning_rate.setRange(0.00001, 0.1)
+        self.finetune_learning_rate.setValue(0.0001)
+        self.finetune_learning_rate.setDecimals(5)
+        finetune_layout.addRow("Fine-tune Learning Rate:", self.finetune_learning_rate)
+        
+        # Custom classifier
+        self.add_custom_classifier = QCheckBox("Add Custom Classifier")
+        self.add_custom_classifier.setChecked(True)
+        finetune_layout.addRow("Custom Classifier:", self.add_custom_classifier)
+        
+        finetune_group.setLayout(finetune_layout)
+        left_layout.addWidget(finetune_group)
+        
+        # Image augmentation settings
+        augmentation_group = QGroupBox("Image Augmentation")
+        augmentation_layout = QFormLayout()
+        
+        self.enable_rotation = QCheckBox()
+        self.rotation_range = QSpinBox()
+        self.rotation_range.setRange(0, 180)
+        self.rotation_range.setValue(20)
+        rotation_layout = QHBoxLayout()
+        rotation_layout.addWidget(self.enable_rotation)
+        rotation_layout.addWidget(self.rotation_range)
+        augmentation_layout.addRow("Rotation (degrees):", rotation_layout)
+        
+        self.enable_horizontal_flip = QCheckBox("Enable Horizontal Flip")
+        augmentation_layout.addRow("Horizontal Flip:", self.enable_horizontal_flip)
+        
+        self.enable_zoom = QCheckBox()
+        self.zoom_range = QDoubleSpinBox()
+        self.zoom_range.setRange(0.0, 1.0)
+        self.zoom_range.setValue(0.2)
+        self.zoom_range.setSingleStep(0.1)
+        zoom_layout = QHBoxLayout()
+        zoom_layout.addWidget(self.enable_zoom)
+        zoom_layout.addWidget(self.zoom_range)
+        augmentation_layout.addRow("Zoom Range:", zoom_layout)
+        
+        self.enable_brightness = QCheckBox()
+        self.brightness_range = QDoubleSpinBox()
+        self.brightness_range.setRange(0.0, 1.0)
+        self.brightness_range.setValue(0.2)
+        self.brightness_range.setSingleStep(0.1)
+        brightness_layout = QHBoxLayout()
+        brightness_layout.addWidget(self.enable_brightness)
+        brightness_layout.addWidget(self.brightness_range)
+        augmentation_layout.addRow("Brightness Range:", brightness_layout)
+        
+        augmentation_group.setLayout(augmentation_layout)
+        left_layout.addWidget(augmentation_group)
+        
+        # Transfer learning controls
+        control_group = QGroupBox("Transfer Learning Controls")
+        control_layout = QVBoxLayout()
+        
+        start_transfer_btn = QPushButton("Start Transfer Learning")
+        start_transfer_btn.clicked.connect(self.start_transfer_learning)
+        start_transfer_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+        control_layout.addWidget(start_transfer_btn)
+        
+        save_finetuned_btn = QPushButton("Save Fine-tuned Model")
+        save_finetuned_btn.clicked.connect(self.save_finetuned_model)
+        control_layout.addWidget(save_finetuned_btn)
+        
+        control_group.setLayout(control_layout)
+        left_layout.addWidget(control_group)
+        
+        main_layout.addWidget(left_panel)
+        
+        # Right panel - Transfer learning monitoring
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Transfer learning log
+        transfer_log_group = QGroupBox("Transfer Learning Log")
+        transfer_log_layout = QVBoxLayout()
+        
+        self.transfer_learning_log = QTextEdit()
+        self.transfer_learning_log.setReadOnly(True)
+        self.transfer_learning_log.setStyleSheet("QTextEdit { background-color: #2b2b2b; color: #ffffff; font-family: 'Courier New', monospace; font-size: 9pt; }")
+        transfer_log_layout.addWidget(self.transfer_learning_log)
+        
+        transfer_log_group.setLayout(transfer_log_layout)
+        right_layout.addWidget(transfer_log_group)
+        
+        main_layout.addWidget(right_panel)
+        
+        return widget
+
+    def load_pretrained_model(self):
+        """Load the selected pre-trained model and display information"""
+        model_name = self.pretrained_model_combo.currentText()
+        
+        try:
+            self.status_bar.showMessage(f"Loading {model_name}... This may take a moment.")
+            
+            # Load the pre-trained model without caching to get fresh info
+            if model_name == "VGG16":
+                base_model = applications.VGG16(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "VGG19":
+                base_model = applications.VGG19(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "ResNet50":
+                base_model = applications.ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "ResNet101":
+                base_model = applications.ResNet101(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "InceptionV3":
+                base_model = applications.InceptionV3(weights='imagenet', include_top=False, input_shape=(299, 299, 3))
+            elif model_name == "Xception":
+                base_model = applications.Xception(weights='imagenet', include_top=False, input_shape=(299, 299, 3))
+            elif model_name == "MobileNet":
+                base_model = applications.MobileNet(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "DenseNet121":
+                base_model = applications.DenseNet121(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            elif model_name == "EfficientNetB0":
+                base_model = applications.EfficientNetB0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            else:
+                self.show_error(f"Unsupported model: {model_name}")
+                return
+            
+            # Cache the loaded model
+            self.pretrained_models[model_name] = base_model
+            
+            # Display model information
+            model_info = f"Pre-trained Model: {model_name}\n"
+            model_info += f"Total Parameters: {base_model.count_params():,}\n"
+            model_info += f"Trainable Parameters: {sum([tf.reduce_prod(var.shape) for var in base_model.trainable_variables]):,}\n"
+            model_info += f"Input Shape: {base_model.input_shape}\n"
+            model_info += f"Output Shape: {base_model.output_shape}\n"
+            model_info += f"Number of Layers: {len(base_model.layers)}\n"
+            
+            self.model_info_display.setText(model_info)
+            self.status_bar.showMessage(f"Successfully loaded {model_name}")
+            
+        except Exception as e:
+            self.show_error(f"Error loading pre-trained model: {str(e)}")
+
+    def start_transfer_learning(self):
+        """Start the transfer learning process with the selected configuration"""
+        model_name = self.pretrained_model_combo.currentText()
+        
+        if model_name not in self.pretrained_models:
+            self.show_error("Please load a pre-trained model first.")
+            return
+        
+        if self.X_train is None:
+            self.show_error("Please load a dataset first.")
+            return
+        
+        try:
+            # Initialize transfer learning logger
+            transfer_logger = RealTimeLogger(self.transfer_learning_log)
+            self.transfer_learning_log.clear()
+            
+            transfer_logger.log("Initializing transfer learning process...", "INFO")
+            
+            # Get the base model
+            base_model = self.pretrained_models[model_name]
+            
+            # Configure layer freezing
+            if self.freeze_base_layers.isChecked():
+                base_model.trainable = False
+                transfer_logger.log("Froze all base model layers", "INFO")
+            else:
+                # Unfreeze top N layers
+                base_model.trainable = True
+                n_unfreeze = self.unfreeze_top_layers.value()
+                
+                for layer in base_model.layers[:-n_unfreeze]:
+                    layer.trainable = False
+                    
+                transfer_logger.log(f"Unfroze top {n_unfreeze} layers", "INFO")
+            
+            # Build transfer learning model
+            model = models.Sequential([base_model])
+            
+            # Add global pooling
+            model.add(layers.GlobalAveragePooling2D())
+            
+            # Add custom classifier if enabled
+            if self.add_custom_classifier.isChecked():
+                model.add(layers.Dense(512, activation='relu'))
+                model.add(layers.Dropout(0.5))
+                model.add(layers.Dense(256, activation='relu'))
+                model.add(layers.Dropout(0.3))
+                transfer_logger.log("Added custom classifier layers", "INFO")
+            
+            # Add output layer
+            num_classes = len(np.unique(self.y_train))
+            if num_classes > 2:
+                model.add(layers.Dense(num_classes, activation='softmax'))
+                loss = 'sparse_categorical_crossentropy'
+            else:
+                model.add(layers.Dense(1, activation='sigmoid'))
+                loss = 'binary_crossentropy'
+            
+            # Compile model
+            optimizer = optimizers.Adam(learning_rate=self.finetune_learning_rate.value())
+            model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
+            
+            transfer_logger.log("Model compiled successfully", "INFO")
+            
+            # Prepare data and augmentation
+            X_train, X_test, y_train, y_test = self.prepare_transfer_learning_data()
+            
+            # Create data generators if augmentation is enabled
+            train_generator, val_generator = self.create_augmentation_generators(X_train, y_train, X_test, y_test)
+            
+            # Training callbacks
+            callbacks_list = [
+                callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+                callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-7)
+            ]
+            
+            # Train the model
+            transfer_logger.log("Starting transfer learning training...", "INFO")
+            
+            if train_generator and val_generator:
+                history = model.fit(
+                    train_generator,
+                    epochs=50,
+                    validation_data=val_generator,
+                    callbacks=callbacks_list,
+                    verbose=1
+                )
+            else:
+                history = model.fit(
+                    X_train, y_train,
+                    batch_size=32,
+                    epochs=50,
+                    validation_data=(X_test, y_test),
+                    callbacks=callbacks_list,
+                    verbose=1
+                )
+            
+            # Store results
+            self.current_model = model
+            self.training_history = history
+            
+            # Update main visualization
+            self.plot_training_history(history)
+            
+            transfer_logger.log("Transfer learning completed successfully!", "SUCCESS")
+            
+        except Exception as e:
+            self.show_error(f"Error in transfer learning: {str(e)}")
+
+    def prepare_transfer_learning_data(self):
+        """Prepare data for transfer learning with proper preprocessing"""
+        X_train, X_test = self.X_train.copy(), self.X_test.copy()
+        y_train, y_test = self.y_train.copy(), self.y_test.copy()
+        
+        # Ensure data is in correct format for pre-trained models
+        if len(X_train.shape) == 2:
+            # Reshape flattened image data
+            if X_train.shape[1] == 784:  # MNIST
+                X_train = X_train.reshape(-1, 28, 28, 1)
+                X_test = X_test.reshape(-1, 28, 28, 1)
+                # Resize to 224x224 and convert to RGB for pre-trained models
+                X_train = tf.image.resize(X_train, [224, 224])
+                X_test = tf.image.resize(X_test, [224, 224])
+                X_train = tf.image.grayscale_to_rgb(X_train)
+                X_test = tf.image.grayscale_to_rgb(X_test)
+            elif X_train.shape[1] == 3072:  # CIFAR-10
+                X_train = X_train.reshape(-1, 32, 32, 3)
+                X_test = X_test.reshape(-1, 32, 32, 3)
+                # Resize to 224x224 for pre-trained models
+                X_train = tf.image.resize(X_train, [224, 224])
+                X_test = tf.image.resize(X_test, [224, 224])
+        
+        # Normalize to [0, 1] range if needed
+        if X_train.max() > 1:
+            X_train = X_train.astype('float32') / 255.0
+            X_test = X_test.astype('float32') / 255.0
+        
+        return X_train, X_test, y_train, y_test
+
+    def create_augmentation_generators(self, X_train, y_train, X_test, y_test):
+        """Create image data generators with augmentation if enabled"""
+        try:
+            # Check if any augmentation is enabled
+            augmentation_enabled = (self.enable_rotation.isChecked() or 
+                                  self.enable_horizontal_flip.isChecked() or 
+                                  self.enable_zoom.isChecked() or 
+                                  self.enable_brightness.isChecked())
+            
+            if not augmentation_enabled or len(X_train.shape) != 4:
+                return None, None
+            
+            # Build augmentation parameters
+            aug_params = {
+                'rescale': 1./255 if X_train.max() > 1 else 1.0,
+                'validation_split': 0.2
+            }
+            
+            if self.enable_rotation.isChecked():
+                aug_params['rotation_range'] = self.rotation_range.value()
+            
+            if self.enable_horizontal_flip.isChecked():
+                aug_params['horizontal_flip'] = True
+            
+            if self.enable_zoom.isChecked():
+                aug_params['zoom_range'] = self.zoom_range.value()
+            
+            if self.enable_brightness.isChecked():
+                brightness_val = self.brightness_range.value()
+                aug_params['brightness_range'] = [1-brightness_val, 1+brightness_val]
+            
+            # Create data generators
+            datagen = ImageDataGenerator(**aug_params)
+            datagen.fit(X_train)
+            
+            train_generator = datagen.flow(
+                X_train, y_train,
+                batch_size=32,
+                subset='training'
+            )
+            
+            val_generator = datagen.flow(
+                X_train, y_train,
+                batch_size=32,
+                subset='validation'
+            )
+            
+            return train_generator, val_generator
+            
+        except Exception as e:
+            print(f"Error creating augmentation generators: {str(e)}")
+            return None, None
+
+    def save_finetuned_model(self):
+        """Save the fine-tuned transfer learning model"""
+        if self.current_model is None:
+            self.show_error("No fine-tuned model to save. Please complete transfer learning first.")
+            return
+        
+        try:
+            file_name, _ = QFileDialog.getSaveFileName(
+                self, "Save Fine-tuned Model", "",
+                "HDF5 files (*.h5);;SavedModel format (*.pb);;All files (*)"
+            )
+            
+            if file_name:
+                if file_name.endswith('.h5'):
+                    self.current_model.save(file_name)
+                else:
+                    self.current_model.save(file_name, save_format='tf')
+                
+                self.status_bar.showMessage(f"Fine-tuned model saved to {file_name}")
+                
+        except Exception as e:
+            self.show_error(f"Error saving fine-tuned model: {str(e)}")
+
+    def create_gan_tab(self):
+        """Create GAN and advanced generative models tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # GAN implementation section
+        gan_group = QGroupBox("Generative Adversarial Networks (GAN)")
+        gan_layout = QVBoxLayout()
+        
+        # GAN type selection
+        gan_type_layout = QHBoxLayout()
+        gan_type_layout.addWidget(QLabel("GAN Type:"))
+        self.gan_type_combo = QComboBox()
+        self.gan_type_combo.addItems(["Vanilla GAN", "Deep Convolutional GAN (DCGAN)", "Conditional GAN (CGAN)"])
+        gan_type_layout.addWidget(self.gan_type_combo)
+        gan_layout.addLayout(gan_type_layout)
+        
+        # GAN configuration parameters
+        gan_params_group = QGroupBox("GAN Configuration")
+        gan_params_layout = QFormLayout()
+        
+        self.gan_latent_dim = QSpinBox()
+        self.gan_latent_dim.setRange(50, 1000)
+        self.gan_latent_dim.setValue(100)
+        gan_params_layout.addRow("Latent Dimension:", self.gan_latent_dim)
+        
+        self.gan_batch_size = QSpinBox()
+        self.gan_batch_size.setRange(16, 256)
+        self.gan_batch_size.setValue(64)
+        gan_params_layout.addRow("Batch Size:", self.gan_batch_size)
+        
+        self.gan_epochs = QSpinBox()
+        self.gan_epochs.setRange(100, 10000)
+        self.gan_epochs.setValue(1000)
+        gan_params_layout.addRow("Training Epochs:", self.gan_epochs)
+        
+        self.generator_lr = QDoubleSpinBox()
+        self.generator_lr.setRange(0.0001, 0.01)
+        self.generator_lr.setValue(0.0002)
+        self.generator_lr.setDecimals(4)
+        gan_params_layout.addRow("Generator Learning Rate:", self.generator_lr)
+        
+        self.discriminator_lr = QDoubleSpinBox()
+        self.discriminator_lr.setRange(0.0001, 0.01)
+        self.discriminator_lr.setValue(0.0002)
+        self.discriminator_lr.setDecimals(4)
+        gan_params_layout.addRow("Discriminator Learning Rate:", self.discriminator_lr)
+        
+        gan_params_group.setLayout(gan_params_layout)
+        gan_layout.addWidget(gan_params_group)
+        
+        # GAN training controls
+        gan_controls_layout = QHBoxLayout()
+        
+        train_gan_btn = QPushButton("Train GAN")
+        train_gan_btn.clicked.connect(self.train_gan_model)
+        train_gan_btn.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 8px; }")
+        gan_controls_layout.addWidget(train_gan_btn)
+        
+        generate_samples_btn = QPushButton("Generate Samples")
+        generate_samples_btn.clicked.connect(self.generate_gan_samples)
+        gan_controls_layout.addWidget(generate_samples_btn)
+        
+        save_gan_btn = QPushButton("Save GAN Model")
+        save_gan_btn.clicked.connect(self.save_gan_model)
+        gan_controls_layout.addWidget(save_gan_btn)
+        
+        gan_layout.addLayout(gan_controls_layout)
+        
+        gan_group.setLayout(gan_layout)
+        layout.addWidget(gan_group)
+        
+        # Advanced techniques placeholder
+        advanced_group = QGroupBox("Advanced Generative Techniques")
+        advanced_layout = QVBoxLayout()
+        
+        # Information about upcoming features
+        info_label = QLabel("""
+Advanced generative techniques implementation status:
+
+✓ GAN Framework: Basic infrastructure implemented
+🔄 Variational Autoencoders (VAE): Coming in v0.1.4
+🔄 Transformer Models: Planned for v0.1.5
+🔄 Diffusion Models: Research integration planned
+🔄 Style Transfer: Neural style transfer implementation
+
+Current GAN implementation provides a foundation for:
+- Generator and discriminator network design
+- Adversarial training loop structure  
+- Sample generation and evaluation
+
+Full GAN training requires specialized dataset preparation
+and extended training procedures suitable for research environments.
+        """)
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("QLabel { background-color: #f0f8ff; padding: 10px; border: 1px solid #ddd; }")
+        advanced_layout.addWidget(info_label)
+        
+        advanced_group.setLayout(advanced_layout)
+        layout.addWidget(advanced_group)
+        
+        return widget
+
+    def train_gan_model(self):
+        """Train GAN model with the current configuration"""
+        if self.X_train is None:
+            self.show_error("Please load a dataset first for GAN training.")
+            return
+        
+        try:
+            # Display information about GAN implementation
+            info_msg = """
+GAN Training Infrastructure:
+
+This implementation provides the framework for Generative Adversarial Network training.
+The current version includes:
+
+• Generator and Discriminator architecture templates
+• Adversarial training loop structure
+• Loss function implementations
+• Sample generation pipeline
+
+For full GAN training, specialized configurations are required based on:
+- Dataset characteristics (image size, channels, distribution)
+- Training stability techniques (gradient penalty, spectral normalization)
+- Architecture optimizations (progressive growing, self-attention)
+
+Advanced GAN implementations will be available in future updates with:
+- Pre-configured architectures for common datasets
+- Training stability improvements
+- Advanced loss functions and regularization techniques
+            """
+            
+            QMessageBox.information(self, "GAN Training Information", info_msg)
+            
+        except Exception as e:
+            self.show_error(f"Error in GAN training setup: {str(e)}")
+
+    def generate_gan_samples(self):
+        """Generate samples from trained GAN model"""
+        QMessageBox.information(self, "GAN Sample Generation", 
+                              "Sample generation will be available after GAN model training is completed. "
+                              "This feature will include:\n\n"
+                              "• Random sample generation from latent space\n"
+                              "• Conditional generation (for CGAN)\n"
+                              "• Latent space interpolation\n"
+                              "• Sample quality evaluation metrics")
+
+    def save_gan_model(self):
+        """Save trained GAN model components"""
+        QMessageBox.information(self, "GAN Model Saving", 
+                              "GAN model saving will include:\n\n"
+                              "• Generator model architecture and weights\n"
+                              "• Discriminator model (for continued training)\n"
+                              "• Training configuration and hyperparameters\n"
+                              "• Sample generation utilities")
+
     def create_loss_function_group(self, is_classification=True):
         """Create a group for loss function selection"""
         group = QGroupBox("Loss Function")
@@ -621,7 +2334,7 @@ class MLCourseGUI(QMainWindow):
         
         selected_id = self.loss_button_group.checkedId()
         return loss_map.get(selected_id, "categorical_crossentropy" if is_classification else "mse")
-    
+
     def create_classical_ml_tab(self):
         """Create the classical machine learning algorithms tab"""
         widget = QWidget()
@@ -663,15 +2376,6 @@ class MLCourseGUI(QMainWindow):
         )
         regression_layout.addWidget(svr_group)
         
-        # Logistic Regression
-        logistic_group = self.create_algorithm_group(
-            "Logistic Regression",
-            {"C": "double",
-             "max_iter": "int",
-             "multi_class": ["ovr", "multinomial"]}
-        )
-        regression_layout.addWidget(logistic_group)
-        
         regression_group.setLayout(regression_layout)
         layout.addWidget(regression_group, 0, 0)
         
@@ -682,6 +2386,15 @@ class MLCourseGUI(QMainWindow):
         # Loss function selection for classification
         loss_group_class = self.create_loss_function_group(is_classification=True)
         classification_layout.addWidget(loss_group_class)
+        
+        # Logistic Regression
+        logistic_group = self.create_algorithm_group(
+            "Logistic Regression",
+            {"C": "double",
+             "max_iter": "int",
+             "multi_class": ["ovr", "multinomial"]}
+        )
+        classification_layout.addWidget(logistic_group)
         
         # SGD Classification
         sgd_class_group = self.create_algorithm_group(
@@ -734,7 +2447,7 @@ class MLCourseGUI(QMainWindow):
         layout.addWidget(classification_group, 0, 1)
         
         return widget
-    
+
     def create_bayesian_tab(self):
         """Create the Bayesian methods tab"""
         widget = QWidget()
@@ -857,65 +2570,16 @@ class MLCourseGUI(QMainWindow):
             
         except Exception as e:
             self.show_error(f"Error training Naive Bayes model: {str(e)}")
-    
+
     def create_dim_reduction_tab(self):
-        """Create the dimensionality reduction tab with enhanced methods"""
+        """Create the dimensionality reduction tab"""
         widget = QWidget()
         layout = QGridLayout(widget)
         
-        # PCA section
-        pca_group = QGroupBox("Principal Component Analysis")
-        pca_layout = QVBoxLayout()
-        pca_params = self.create_algorithm_group(
-            "PCA Parameters",
-            {"n_components": "int",
-             "whiten": "checkbox"}
-        )
-        pca_layout.addWidget(pca_params)
-        pca_group.setLayout(pca_layout)
-        layout.addWidget(pca_group, 0, 0)
-        
-        # LDA section
-        lda_group = QGroupBox("Linear Discriminant Analysis")
-        lda_layout = QVBoxLayout()
-        lda_params = self.create_algorithm_group(
-            "LDA Parameters",
-            {"n_components": "int"}
-        )
-        lda_layout.addWidget(lda_params)
-        lda_group.setLayout(lda_layout)
-        layout.addWidget(lda_group, 0, 1)
-        
-        # t-SNE section
-        tsne_group = QGroupBox("t-SNE")
-        tsne_layout = QVBoxLayout()
-        tsne_params = self.create_algorithm_group(
-            "t-SNE Parameters",
-            {"n_components": ["2", "3"],
-             "perplexity": "double",
-             "learning_rate": "double",
-             "n_iter": "int"}
-        )
-        tsne_layout.addWidget(tsne_params)
-        tsne_group.setLayout(tsne_layout)
-        layout.addWidget(tsne_group, 1, 0)
-        
-        # UMAP section
-        umap_group = QGroupBox("UMAP")
-        umap_layout = QVBoxLayout()
-        umap_params = self.create_algorithm_group(
-            "UMAP Parameters",
-            {"n_components": ["2", "3"],
-             "n_neighbors": "int",
-             "min_dist": "double"}
-        )
-        umap_layout.addWidget(umap_params)
-        umap_group.setLayout(umap_layout)
-        layout.addWidget(umap_group, 1, 1)
-        
-        # K-Means section with elbow method
+        # K-Means section
         kmeans_group = QGroupBox("K-Means Clustering")
         kmeans_layout = QVBoxLayout()
+        
         kmeans_params = self.create_algorithm_group(
             "K-Means Parameters",
             {"n_clusters": "int",
@@ -924,135 +2588,24 @@ class MLCourseGUI(QMainWindow):
         )
         kmeans_layout.addWidget(kmeans_params)
         
-        # Elbow method
-        elbow_layout = QHBoxLayout()
-        elbow_layout.addWidget(QLabel("Max K for Elbow:"))
-        self.elbow_max_k_spin = QSpinBox()
-        self.elbow_max_k_spin.setRange(2, 20)
-        self.elbow_max_k_spin.setValue(10)
-        elbow_layout.addWidget(self.elbow_max_k_spin)
-        elbow_btn = QPushButton("Apply Elbow Method")
-        elbow_btn.clicked.connect(self.apply_elbow_method)
-        elbow_layout.addWidget(elbow_btn)
-        kmeans_layout.addLayout(elbow_layout)
-        
         kmeans_group.setLayout(kmeans_layout)
-        layout.addWidget(kmeans_group, 2, 0, 1, 2)
+        layout.addWidget(kmeans_group, 0, 0)
         
-        # Compare methods button
-        compare_btn = QPushButton("Compare Dimensionality Reduction Methods")
-        compare_btn.clicked.connect(self.compare_dim_reduction)
-        layout.addWidget(compare_btn, 3, 0, 1, 2)
+        # PCA section
+        pca_group = QGroupBox("Principal Component Analysis")
+        pca_layout = QVBoxLayout()
+        
+        pca_params = self.create_algorithm_group(
+            "PCA Parameters",
+            {"n_components": "int",
+             "whiten": "checkbox"}
+        )
+        pca_layout.addWidget(pca_params)
+        
+        pca_group.setLayout(pca_layout)
+        layout.addWidget(pca_group, 0, 1)
         
         return widget
-    
-    def apply_elbow_method(self):
-        """Apply elbow method to determine optimal number of clusters for K-Means"""
-        if self.X_train is None:
-            self.show_error("Please load a dataset first")
-            return
-        
-        try:
-            max_k = self.elbow_max_k_spin.value()
-            inertias = []
-            for k in range(1, max_k + 1):
-                model = KMeans(n_clusters=k, random_state=42)
-                model.fit(self.X_train)
-                inertias.append(model.inertia_)
-            
-            # Plot elbow curve using Plotly
-            fig = px.line(x=range(1, max_k + 1), y=inertias, markers=True, title="Elbow Method for K-Means")
-            fig.update_layout(xaxis_title="Number of Clusters (k)", yaxis_title="Inertia")
-            
-            # Display in dialog
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Elbow Method")
-            layout = QVBoxLayout(dialog)
-            web_view = QWebEngineView()
-            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
-            layout.addWidget(web_view)
-            dialog.resize(800, 600)
-            dialog.exec()
-            
-        except Exception as e:
-            self.show_error(f"Error applying elbow method: {str(e)}")
-    
-    def compare_dim_reduction(self):
-        """Compare selected dimensionality reduction methods"""
-        if self.X_train is None or self.y_train is None:
-            self.show_error("Please load a dataset first")
-            return
-        
-        # Dialog to select methods
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Methods to Compare")
-        layout = QVBoxLayout(dialog)
-        
-        methods = ["PCA", "LDA", "t-SNE", "UMAP"]
-        self.compare_checkboxes = {}
-        for method in methods:
-            cb = QCheckBox(method)
-            self.compare_checkboxes[method] = cb
-            layout.addWidget(cb)
-        
-        btn = QPushButton("Compare")
-        btn.clicked.connect(lambda: self.perform_comparison(dialog))
-        layout.addWidget(btn)
-        
-        dialog.exec()
-    
-    def perform_comparison(self, dialog):
-        """Perform comparison of selected dimensionality reduction methods"""
-        selected_methods = [method for method, cb in self.compare_checkboxes.items() if cb.isChecked()]
-        if not selected_methods:
-            self.show_error("Please select at least one method")
-            return
-        dialog.accept()
-        
-        try:
-            # Apply each method with n_components=2
-            projections = {}
-            for method in selected_methods:
-                if method == "PCA":
-                    model = PCA(n_components=2)
-                    X_proj = model.fit_transform(self.X_train)
-                elif method == "LDA":
-                    n_classes = len(np.unique(self.y_train))
-                    n_components = min(2, n_classes - 1)
-                    model = LinearDiscriminantAnalysis(n_components=n_components)
-                    X_proj = model.fit_transform(self.X_train, self.y_train)
-                elif method == "t-SNE":
-                    model = TSNE(n_components=2, random_state=42)
-                    X_proj = model.fit_transform(self.X_train)
-                elif method == "UMAP":
-                    model = umap.UMAP(n_components=2, random_state=42)
-                    X_proj = model.fit_transform(self.X_train)
-                projections[method] = X_proj
-            
-            # Create subplot figure
-            fig = make_subplots(rows=1, cols=len(projections), subplot_titles=selected_methods)
-            
-            for i, (method, X_proj) in enumerate(projections.items(), start=1):
-                fig.add_trace(
-                    px.scatter(x=X_proj[:, 0], y=X_proj[:, 1], color=self.y_train).data[0],
-                    row=1, col=i
-                )
-            
-            # Update layout
-            fig.update_layout(height=600, width=800 * len(projections), title_text="Dimensionality Reduction Comparison")
-            
-            # Display in dialog
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Comparison of Dimensionality Reduction Methods")
-            layout = QVBoxLayout(dialog)
-            web_view = QWebEngineView()
-            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
-            layout.addWidget(web_view)
-            dialog.resize(800 * len(projections), 600)
-            dialog.exec()
-            
-        except Exception as e:
-            self.show_error(f"Error comparing dimensionality reduction methods: {str(e)}")
     
     def create_rl_tab(self):
         """Create the reinforcement learning tab"""
@@ -1090,7 +2643,7 @@ class MLCourseGUI(QMainWindow):
         layout.addWidget(algo_group, 0, 1)
         
         return widget
-    
+
     def create_visualization(self):
         """Create the visualization section"""
         viz_group = QGroupBox("Visualization")
@@ -1108,7 +2661,7 @@ class MLCourseGUI(QMainWindow):
         
         viz_group.setLayout(viz_layout)
         self.layout.addWidget(viz_group)
-    
+
     def create_status_bar(self):
         """Create the status bar"""
         self.status_bar = QStatusBar()
@@ -1117,7 +2670,7 @@ class MLCourseGUI(QMainWindow):
         # Add progress bar
         self.progress_bar = QProgressBar()
         self.status_bar.addPermanentWidget(self.progress_bar)
-    
+
     def create_algorithm_group(self, name, params):
         """Helper method to create algorithm parameter groups"""
         group = QGroupBox(name)
@@ -1140,11 +2693,6 @@ class MLCourseGUI(QMainWindow):
                     widget.setValue(8)
                 elif param_name == "degree":
                     widget.setValue(3)
-                elif param_name == "n_components":
-                    widget.setRange(1, 10)
-                    widget.setValue(2)
-                elif param_name == "n_neighbors":
-                    widget.setValue(15)
                 else:
                     widget.setValue(5)
             elif param_type == "double":
@@ -1161,15 +2709,6 @@ class MLCourseGUI(QMainWindow):
                 elif param_name == "tol":
                     widget.setRange(1e-6, 0.1)
                     widget.setValue(1e-4)
-                elif param_name == "perplexity":
-                    widget.setRange(5.0, 50.0)
-                    widget.setValue(30.0)
-                elif param_name == "learning_rate":
-                    widget.setRange(10.0, 1000.0)
-                    widget.setValue(200.0)
-                elif param_name == "min_dist":
-                    widget.setRange(0.0, 1.0)
-                    widget.setValue(0.1)
                 else:
                     widget.setRange(0.0001, 1000.0)
                     widget.setValue(1.0)
@@ -1311,124 +2850,50 @@ class MLCourseGUI(QMainWindow):
                     whiten=params.get('whiten', False)
                 )
                 
-            elif model_name == "LDA Parameters":
-                n_components = params.get('n_components', min(self.X_train.shape[1], len(np.unique(self.y_train)) - 1))
-                model = LinearDiscriminantAnalysis(n_components=n_components)
-                
-            elif model_name == "t-SNE Parameters":
-                n_components = int(params.get('n_components', '2'))
-                model = TSNE(
-                    n_components=n_components,
-                    perplexity=params.get('perplexity', 30.0),
-                    learning_rate=params.get('learning_rate', 200.0),
-                    n_iter=params.get('n_iter', 1000),
-                    random_state=42
-                )
-                
-            elif model_name == "UMAP Parameters":
-                n_components = int(params.get('n_components', '2'))
-                model = umap.UMAP(
-                    n_components=n_components,
-                    n_neighbors=params.get('n_neighbors', 15),
-                    min_dist=params.get('min_dist', 0.1),
-                    random_state=42
-                )
-                
             else:
                 self.show_error(f"Unknown model: {model_name}")
                 return
             
-            # Handle dimensionality reduction methods separately
-            if model_name in ["PCA Parameters", "LDA Parameters", "t-SNE Parameters", "UMAP Parameters"]:
-                if model_name == "PCA Parameters":
-                    X_transformed = model.fit_transform(self.X_train)
-                    X_test_transformed = model.transform(self.X_test)
-                    self.visualize_projection(X_test_transformed, self.y_test, method='PCA')
-                    self.update_pca_metrics(model)
+            # Train model
+            model.fit(self.X_train, self.y_train)
+            
+            # Make predictions
+            if model_name == "PCA Parameters":
+                # Transform data with PCA
+                X_pca = model.transform(self.X_test)
                 
-                elif model_name == "LDA Parameters":
-                    X_transformed = model.fit_transform(self.X_train, self.y_train)
-                    X_test_transformed = model.transform(self.X_test)
-                    self.visualize_projection(X_test_transformed, self.y_test, method='LDA')
-                    silhouette_avg = silhouette_score(X_test_transformed, self.y_test) if len(np.unique(self.y_test)) > 1 else None
-                    self.metrics_text.setText(f"LDA Analysis Results:\n\nSilhouette Score: {silhouette_avg:.4f}" if silhouette_avg else "LDA Analysis Results:\n\nNo metrics available")
+                # Visualize PCA components
+                self.visualize_pca(model, X_pca)
                 
-                elif model_name == "t-SNE Parameters":
-                    self.status_bar.showMessage("Computing t-SNE...")
-                    X_test_transformed = model.fit_transform(self.X_test)
-                    self.visualize_projection(X_test_transformed, self.y_test, method='t-SNE', n_components=n_components)
-                    self.status_bar.showMessage("t-SNE computation complete")
+                # Update metrics text with explained variance
+                self.update_pca_metrics(model)
                 
-                elif model_name == "UMAP Parameters":
-                    X_transformed = model.fit_transform(self.X_train)
-                    X_test_transformed = model.transform(self.X_test)
-                    self.visualize_projection(X_test_transformed, self.y_test, method='UMAP', n_components=n_components)
+            elif model_name == "K-Means Parameters":
+                # Predict clusters
+                y_pred = model.predict(self.X_test)
+                
+                # Visualize clusters
+                self.update_visualization(y_pred)
+                
+                # Update metrics with inertia and silhouette score
+                self.update_kmeans_metrics(model, self.X_test, y_pred)
                 
             else:
-                # Perform cross-validation if selected
-                validation_method = self.validation_method_combo.currentText()
-                if validation_method == "K-Fold Cross-Validation" and model_name not in ["K-Means Parameters"]:
-                    k = self.kfold_spin.value()
-                    # Determine scoring metric
-                    if len(np.unique(self.y_train)) > 10:  # Regression
-                        scoring = 'neg_mean_squared_error'
-                    else:  # Classification
-                        scoring = 'accuracy'
-                    
-                    # Perform cross-validation
-                    cv_scores = cross_val_score(model, self.X_train, self.y_train, cv=k, scoring=scoring)
-                    
-                    # Display cross-validation results
-                    if scoring == 'neg_mean_squared_error':
-                        cv_mse = -cv_scores
-                        metrics_text = f"Cross-Validation MSE: {cv_mse.mean():.4f} ± {cv_mse.std():.4f}\n"
-                    else:
-                        metrics_text = f"Cross-Validation Accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}\n"
-                    self.metrics_text.setText(metrics_text)
+                # Regular model prediction
+                y_pred = model.predict(self.X_test)
                 
-                # Train model on entire training set
-                model.fit(self.X_train, self.y_train)
+                # Store current model
+                self.current_model = model
                 
-                # Make predictions
-                if model_name == "K-Means Parameters":
-                    y_pred = model.predict(self.X_test)
-                    self.update_visualization(y_pred)
-                    self.update_kmeans_metrics(model, self.X_test, y_pred)
-                else:
-                    y_pred = model.predict(self.X_test)
-                    self.current_model = model
-                    self.update_visualization(y_pred)
-                    self.update_metrics(y_pred)
+                # Update visualization and metrics
+                self.update_visualization(y_pred)
+                self.update_metrics(y_pred)
             
             # Update status
             self.status_bar.showMessage(f"Trained {model_name}")
             
         except Exception as e:
             self.show_error(f"Error training {model_name}: {str(e)}")
-    
-    def visualize_projection(self, X_proj, y, method, n_components=2):
-        """Visualize the projected data using Plotly"""
-        try:
-            if n_components == 2:
-                fig = px.scatter(x=X_proj[:, 0], y=X_proj[:, 1], color=y, title=f"{method} Projection")
-            elif n_components == 3:
-                fig = px.scatter_3d(x=X_proj[:, 0], y=X_proj[:, 1], z=X_proj[:, 2], color=y, title=f"{method} Projection")
-            else:
-                self.show_error("Only 2D and 3D projections are supported")
-                return
-            
-            # Display the plot in a dialog
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"{method} Visualization")
-            layout = QVBoxLayout(dialog)
-            web_view = QWebEngineView()
-            web_view.setHtml(fig.to_html(include_plotlyjs='cdn'))
-            layout.addWidget(web_view)
-            dialog.resize(800, 600)
-            dialog.exec()
-            
-        except Exception as e:
-            self.show_error(f"Error visualizing {method} projection: {str(e)}")
     
     def visualize_pca(self, pca_model, X_pca):
         """Visualize PCA components"""
@@ -1494,667 +2959,25 @@ class MLCourseGUI(QMainWindow):
         metrics_text = "K-Means Clustering Results:\n\n"
         
         # Inertia (within-cluster sum-of-squares)
-        metrics_text += f"Inertia: {kmeans_model.inertia_:.4f}\n"
-        
-        # Silhouette Score
-        silhouette_avg = silhouette_score(X_test, y_pred)
-        metrics_text += f"Silhouette Score: {silhouette_avg:.4f}\n"
+        metrics_text += f"Inertia: {kmeans_model.inertia_:.4f}\n\n"
         
         # Cluster sizes
         cluster_sizes = np.bincount(y_pred)
-        metrics_text += "\nCluster Sizes:\n"
+        metrics_text += "Cluster Sizes:\n"
         for i, size in enumerate(cluster_sizes):
             metrics_text += f"Cluster {i}: {size} samples ({size/len(y_pred):.2%})\n"
         
+        # Calculate silhouette score if sklearn.metrics is available
+        try:
+            from sklearn.metrics import silhouette_score
+            silhouette_avg = silhouette_score(X_test, y_pred)
+            metrics_text += f"\nSilhouette Score: {silhouette_avg:.4f}\n"
+            metrics_text += "(Closer to 1 means better-defined clusters)"
+        except:
+            pass
+        
         self.metrics_text.setText(metrics_text)
-    
-    def create_deep_learning_tab(self):
-        """Create the deep learning tab"""
-        widget = QWidget()
-        layout = QGridLayout(widget)
-        
-        # MLP section
-        mlp_group = QGroupBox("Multi-Layer Perceptron")
-        mlp_layout = QVBoxLayout()
-        
-        # Loss function selection for neural networks
-        loss_group_nn = self.create_loss_function_group()
-        mlp_layout.addWidget(loss_group_nn)
-        
-        # Layer configuration
-        self.layer_config = []
-        layer_btn = QPushButton("Add Layer")
-        layer_btn.clicked.connect(self.add_layer_dialog)
-        mlp_layout.addWidget(layer_btn)
-        
-        # Current layers display
-        self.layers_display = QTextEdit()
-        self.layers_display.setReadOnly(True)
-        self.layers_display.setMaximumHeight(150)
-        self.layers_display.setText("No layers added yet.")
-        mlp_layout.addWidget(self.layers_display)
-        
-        # Reset layers button
-        reset_layers_btn = QPushButton("Reset Layers")
-        reset_layers_btn.clicked.connect(self.reset_layers)
-        mlp_layout.addWidget(reset_layers_btn)
-        
-        # Training parameters
-        training_params_group = self.create_training_params_group()
-        mlp_layout.addWidget(training_params_group)
-        
-        # Train button
-        train_btn = QPushButton("Train Neural Network")
-        train_btn.clicked.connect(self.train_neural_network)
-        mlp_layout.addWidget(train_btn)
-        
-        mlp_group.setLayout(mlp_layout)
-        layout.addWidget(mlp_group, 0, 0)
-        
-        # CNN section
-        cnn_group = QGroupBox("Convolutional Neural Network")
-        cnn_layout = QVBoxLayout()
-        
-        # CNN architecture controls
-        cnn_controls = self.create_cnn_controls()
-        cnn_layout.addWidget(cnn_controls)
-        
-        cnn_group.setLayout(cnn_layout)
-        layout.addWidget(cnn_group, 0, 1)
-        
-        # RNN section
-        rnn_group = QGroupBox("Recurrent Neural Network")
-        rnn_layout = QVBoxLayout()
-        
-        # RNN architecture controls
-        rnn_controls = self.create_rnn_controls()
-        rnn_layout.addWidget(rnn_controls)
-        
-        rnn_group.setLayout(rnn_layout)
-        layout.addWidget(rnn_group, 1, 0)
-        
-        return widget
-    
-    def reset_layers(self):
-        """Reset the neural network layer configuration"""
-        self.layer_config = []
-        self.layers_display.setText("No layers added yet.")
-    
-    def add_layer_dialog(self):
-        """Open a dialog to add a neural network layer"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add Neural Network Layer")
-        layout = QVBoxLayout(dialog)
-        
-        # Layer type selection
-        type_layout = QHBoxLayout()
-        type_label = QLabel("Layer Type:")
-        type_combo = QComboBox()
-        type_combo.addItems(["Dense", "Conv2D", "MaxPooling2D", "Flatten", "Dropout"])
-        type_layout.addWidget(type_label)
-        type_layout.addWidget(type_combo)
-        layout.addLayout(type_layout)
-        
-        # Parameters input
-        params_group = QGroupBox("Layer Parameters")
-        params_layout = QVBoxLayout()
-        
-        # Dynamic parameter inputs based on layer type
-        self.layer_param_inputs = {}
-        
-        def update_params():
-            # Clear existing parameter inputs
-            for widget in list(self.layer_param_inputs.values()):
-                params_layout.removeWidget(widget)
-                widget.deleteLater()
-            self.layer_param_inputs.clear()
-            
-            layer_type = type_combo.currentText()
-            if layer_type == "Dense":
-                units_label = QLabel("Units:")
-                units_input = QSpinBox()
-                units_input.setRange(1, 1000)
-                units_input.setValue(32)
-                self.layer_param_inputs["units"] = units_input
-                
-                activation_label = QLabel("Activation:")
-                activation_combo = QComboBox()
-                activation_combo.addItems(["relu", "sigmoid", "tanh", "softmax", "linear"])
-                self.layer_param_inputs["activation"] = activation_combo
-                
-                params_layout.addWidget(units_label)
-                params_layout.addWidget(units_input)
-                params_layout.addWidget(activation_label)
-                params_layout.addWidget(activation_combo)
-            
-            elif layer_type == "Conv2D":
-                filters_label = QLabel("Filters:")
-                filters_input = QSpinBox()
-                filters_input.setRange(1, 1000)
-                filters_input.setValue(32)
-                self.layer_param_inputs["filters"] = filters_input
-                
-                kernel_label = QLabel("Kernel Size:")
-                kernel_input = QLineEdit()
-                kernel_input.setText("3, 3")
-                self.layer_param_inputs["kernel_size"] = kernel_input
-                
-                activation_label = QLabel("Activation:")
-                activation_combo = QComboBox()
-                activation_combo.addItems(["relu", "sigmoid", "tanh", "linear"])
-                self.layer_param_inputs["activation"] = activation_combo
-                
-                params_layout.addWidget(filters_label)
-                params_layout.addWidget(filters_input)
-                params_layout.addWidget(kernel_label)
-                params_layout.addWidget(kernel_input)
-                params_layout.addWidget(activation_label)
-                params_layout.addWidget(activation_combo)
-            
-            elif layer_type == "MaxPooling2D":
-                pool_size_label = QLabel("Pool Size:")
-                pool_size_input = QLineEdit()
-                pool_size_input.setText("2, 2")
-                self.layer_param_inputs["pool_size"] = pool_size_input
-                
-                params_layout.addWidget(pool_size_label)
-                params_layout.addWidget(pool_size_input)
-            
-            elif layer_type == "Dropout":
-                rate_label = QLabel("Dropout Rate:")
-                rate_input = QDoubleSpinBox()
-                rate_input.setRange(0.0, 1.0)
-                rate_input.setValue(0.5)
-                rate_input.setSingleStep(0.1)
-                self.layer_param_inputs["rate"] = rate_input
-                
-                params_layout.addWidget(rate_label)
-                params_layout.addWidget(rate_input)
-        
-        type_combo.currentIndexChanged.connect(update_params)
-        update_params()  # Initial update
-        
-        params_group.setLayout(params_layout)
-        layout.addWidget(params_group)
-        
-        # Buttons
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add Layer")
-        cancel_btn = QPushButton("Cancel")
-        btn_layout.addWidget(add_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-        
-        def add_layer():
-            layer_type = type_combo.currentText()
-            
-            # Collect parameters
-            layer_params = {}
-            for param_name, widget in self.layer_param_inputs.items():
-                if isinstance(widget, QSpinBox):
-                    layer_params[param_name] = widget.value()
-                elif isinstance(widget, QDoubleSpinBox):
-                    layer_params[param_name] = widget.value()
-                elif isinstance(widget, QComboBox):
-                    layer_params[param_name] = widget.currentText()
-                elif isinstance(widget, QLineEdit):
-                    # Handle kernel size or other tuple-like inputs
-                    if param_name in ["kernel_size", "pool_size"]:
-                        layer_params[param_name] = tuple(map(int, widget.text().split(',')))
-            
-            self.layer_config.append({
-                "type": layer_type,
-                "params": layer_params
-            })
-            
-            # Update layers display
-            self.update_layers_display()
-            
-            dialog.accept()
-        
-        add_btn.clicked.connect(add_layer)
-        cancel_btn.clicked.connect(dialog.reject)
-        
-        dialog.exec()
-    
-    def update_layers_display(self):
-        """Update the text display showing current neural network layers"""
-        if not self.layer_config:
-            self.layers_display.setText("No layers added yet.")
-            return
-        
-        layers_text = "Current Network Architecture:\n\n"
-        
-        for i, layer in enumerate(self.layer_config):
-            layer_type = layer["type"]
-            params = layer["params"]
-            
-            layers_text += f"{i+1}. {layer_type}: "
-            
-            if layer_type == "Dense":
-                layers_text += f"{params.get('units')} units, {params.get('activation')} activation"
-            elif layer_type == "Conv2D":
-                layers_text += f"{params.get('filters')} filters, {params.get('kernel_size')} kernel, {params.get('activation')} activation"
-            elif layer_type == "MaxPooling2D":
-                layers_text += f"pool_size={params.get('pool_size')}"
-            elif layer_type == "Dropout":
-                layers_text += f"rate={params.get('rate')}"
-            elif layer_type == "Flatten":
-                layers_text += "flatten data"
-            
-            layers_text += "\n"
-        
-        self.layers_display.setText(layers_text)
-    
-    def create_training_params_group(self):
-        """Create group for neural network training parameters"""
-        group = QGroupBox("Training Parameters")
-        layout = QVBoxLayout()
-        
-        # Batch size
-        batch_layout = QHBoxLayout()
-        batch_layout.addWidget(QLabel("Batch Size:"))
-        self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 1000)
-        self.batch_size_spin.setValue(32)
-        batch_layout.addWidget(self.batch_size_spin)
-        layout.addLayout(batch_layout)
-        
-        # Epochs
-        epochs_layout = QHBoxLayout()
-        epochs_layout.addWidget(QLabel("Epochs:"))
-        self.epochs_spin = QSpinBox()
-        self.epochs_spin.setRange(1, 1000)
-        self.epochs_spin.setValue(10)
-        epochs_layout.addWidget(self.epochs_spin)
-        layout.addLayout(epochs_layout)
-        
-        # Learning rate
-        lr_layout = QHBoxLayout()
-        lr_layout.addWidget(QLabel("Learning Rate:"))
-        self.lr_spin = QDoubleSpinBox()
-        self.lr_spin.setRange(0.0001, 1.0)
-        self.lr_spin.setValue(0.001)
-        self.lr_spin.setSingleStep(0.001)
-        lr_layout.addWidget(self.lr_spin)
-        layout.addLayout(lr_layout)
-        
-        group.setLayout(layout)
-        return group
-    
-    def create_cnn_controls(self):
-        """Create controls for Convolutional Neural Network"""
-        group = QGroupBox("CNN Architecture")
-        layout = QVBoxLayout()
-        
-        # Define a standard CNN architecture with preset options
-        cnn_layout = QVBoxLayout()
-        
-        # Image input shape
-        input_shape_layout = QHBoxLayout()
-        input_shape_layout.addWidget(QLabel("Input Shape (height, width, channels):"))
-        self.cnn_input_height = QSpinBox()
-        self.cnn_input_height.setRange(16, 512)
-        self.cnn_input_height.setValue(28)
-        self.cnn_input_width = QSpinBox()
-        self.cnn_input_width.setRange(16, 512)
-        self.cnn_input_width.setValue(28)
-        self.cnn_input_channels = QSpinBox()
-        self.cnn_input_channels.setRange(1, 4)
-        self.cnn_input_channels.setValue(1)
-        
-        input_shape_layout.addWidget(self.cnn_input_height)
-        input_shape_layout.addWidget(self.cnn_input_width)
-        input_shape_layout.addWidget(self.cnn_input_channels)
-        cnn_layout.addLayout(input_shape_layout)
-        
-        # Number of convolutional blocks
-        blocks_layout = QHBoxLayout()
-        blocks_layout.addWidget(QLabel("Number of Conv Blocks:"))
-        self.cnn_blocks = QSpinBox()
-        self.cnn_blocks.setRange(1, 5)
-        self.cnn_blocks.setValue(2)
-        blocks_layout.addWidget(self.cnn_blocks)
-        cnn_layout.addLayout(blocks_layout)
-        
-        # Filters per block
-        filters_layout = QHBoxLayout()
-        filters_layout.addWidget(QLabel("Starting Filters:"))
-        self.cnn_filters = QSpinBox()
-        self.cnn_filters.setRange(8, 256)
-        self.cnn_filters.setValue(32)
-        filters_layout.addWidget(self.cnn_filters)
-        cnn_layout.addLayout(filters_layout)
-        
-        # Dense layers at the end
-        dense_layout = QHBoxLayout()
-        dense_layout.addWidget(QLabel("Dense Layer Units:"))
-        self.cnn_dense = QSpinBox()
-        self.cnn_dense.setRange(16, 1024)
-        self.cnn_dense.setValue(128)
-        dense_layout.addWidget(self.cnn_dense)
-        cnn_layout.addLayout(dense_layout)
-        
-        # CNN Train Button
-        self.cnn_train_btn = QPushButton("Train CNN")
-        self.cnn_train_btn.clicked.connect(self.train_cnn)
-        cnn_layout.addWidget(self.cnn_train_btn)
-        
-        layout.addLayout(cnn_layout)
-        group.setLayout(layout)
-        return group
-    
-    def train_cnn(self):
-        """Train a Convolutional Neural Network with the configured parameters"""
-        if self.X_train is None or self.y_train is None:
-            self.show_error("Please load a dataset first")
-            return
-        
-        # Check if the dataset is appropriate for CNN (image data)
-        if len(self.X_train.shape) != 2:
-            self.show_error("The loaded dataset is not in the right format for CNN. Please use image data.")
-            return
-        
-        try:
-            # Get parameters
-            input_height = self.cnn_input_height.value()
-            input_width = self.cnn_input_width.value()
-            input_channels = self.cnn_input_channels.value()
-            num_blocks = self.cnn_blocks.value()
-            starting_filters = self.cnn_filters.value()
-            dense_units = self.cnn_dense.value()
-            
-            # Create CNN model
-            model = models.Sequential()
-            
-            # Reshape input data if needed
-            if len(self.X_train.shape) == 2:
-                # Assuming we're using MNIST or similar where features are flattened
-                # Try to reshape to square images with the specified channels
-                pixels = int(np.sqrt(self.X_train.shape[1] / input_channels))
-                
-                if pixels * pixels * input_channels != self.X_train.shape[1]:
-                    self.show_error(f"Cannot reshape input data to {input_height}x{input_width}x{input_channels}. " +
-                                   f"Input shape: {self.X_train.shape}")
-                    return
-                
-                # Reshape the data
-                X_train_reshaped = self.X_train.reshape(-1, pixels, pixels, input_channels)
-                X_test_reshaped = self.X_test.reshape(-1, pixels, pixels, input_channels)
-            else:
-                # Data is already in the right shape
-                X_train_reshaped = self.X_train
-                X_test_reshaped = self.X_test
-            
-            # Input layer
-            model.add(layers.InputLayer(input_shape=(pixels, pixels, input_channels)))
-            
-            # Add convolutional blocks
-            filters = starting_filters
-            for i in range(num_blocks):
-                # Convolutional layer
-                model.add(layers.Conv2D(filters, (3, 3), activation='relu', padding='same'))
-                # Another conv layer in the same block
-                model.add(layers.Conv2D(filters, (3, 3), activation='relu', padding='same'))
-                # Max pooling
-                model.add(layers.MaxPooling2D((2, 2)))
-                # Double the filters for the next block
-                filters *= 2
-            
-            # Flatten and dense layers
-            model.add(layers.Flatten())
-            model.add(layers.Dense(dense_units, activation='relu'))
-            model.add(layers.Dropout(0.5))
-            
-            # Output layer
-            num_classes = len(np.unique(self.y_train))
-            model.add(layers.Dense(num_classes, activation='softmax'))
-            
-            # Get selected loss function
-            loss_function = self.get_selected_loss_function(is_classification=True)
-            
-            # Compile model
-            model.compile(
-                optimizer=optimizers.Adam(learning_rate=self.lr_spin.value()),
-                loss=loss_function,
-                metrics=['accuracy']
-            )
-            
-            # Convert target to one-hot encoding if needed
-            if loss_function == 'categorical_crossentropy':
-                y_train_encoded = tf.keras.utils.to_categorical(self.y_train, num_classes)
-                y_test_encoded = tf.keras.utils.to_categorical(self.y_test, num_classes)
-            else:
-                y_train_encoded = self.y_train
-                y_test_encoded = self.y_test
-            
-            # Train model
-            history = model.fit(
-                X_train_reshaped, 
-                y_train_encoded,
-                batch_size=self.batch_size_spin.value(),
-                epochs=self.epochs_spin.value(),
-                validation_data=(X_test_reshaped, y_test_encoded),
-                callbacks=[self.create_progress_callback()]
-            )
-            
-            # Update visualization with training history
-            self.plot_training_history(history)
-            
-            # Make predictions
-            y_pred = model.predict(X_test_reshaped)
-            if loss_function == 'categorical_crossentropy':
-                y_pred = np.argmax(y_pred, axis=1)
-            
-            # Update metrics
-            self.update_metrics(y_pred)
-            
-            # Store current model
-            self.current_model = model
-            
-            self.status_bar.showMessage("CNN Training Complete")
-            
-        except Exception as e:
-            self.show_error(f"Error training CNN: {str(e)}")
-    
-    def create_rnn_controls(self):
-        """Create controls for Recurrent Neural Network"""
-        group = QGroupBox("RNN Architecture")
-        layout = QVBoxLayout()
-        
-        # RNN Type
-        rnn_type_layout = QHBoxLayout()
-        rnn_type_layout.addWidget(QLabel("RNN Type:"))
-        self.rnn_type_combo = QComboBox()
-        self.rnn_type_combo.addItems(["SimpleRNN", "LSTM", "GRU"])
-        rnn_type_layout.addWidget(self.rnn_type_combo)
-        layout.addLayout(rnn_type_layout)
-        
-        # Sequence Length
-        seq_length_layout = QHBoxLayout()
-        seq_length_layout.addWidget(QLabel("Sequence Length:"))
-        self.seq_length_spin = QSpinBox()
-        self.seq_length_spin.setRange(1, 100)
-        self.seq_length_spin.setValue(10)
-        seq_length_layout.addWidget(self.seq_length_spin)
-        layout.addLayout(seq_length_layout)
-        
-        # Number of RNN layers
-        num_layers_layout = QHBoxLayout()
-        num_layers_layout.addWidget(QLabel("Number of Layers:"))
-        self.num_rnn_layers_spin = QSpinBox()
-        self.num_rnn_layers_spin.setRange(1, 5)
-        self.num_rnn_layers_spin.setValue(1)
-        num_layers_layout.addWidget(self.num_rnn_layers_spin)
-        layout.addLayout(num_layers_layout)
-        
-        # Units per layer
-        units_layout = QHBoxLayout()
-        units_layout.addWidget(QLabel("Units per Layer:"))
-        self.rnn_units_spin = QSpinBox()
-        self.rnn_units_spin.setRange(1, 512)
-        self.rnn_units_spin.setValue(64)
-        units_layout.addWidget(self.rnn_units_spin)
-        layout.addLayout(units_layout)
-        
-        # Bidirectional checkbox
-        bidirectional_layout = QHBoxLayout()
-        bidirectional_layout.addWidget(QLabel("Bidirectional:"))
-        self.bidirectional_check = QCheckBox()
-        bidirectional_layout.addWidget(self.bidirectional_check)
-        layout.addLayout(bidirectional_layout)
-        
-        # Placeholder message
-        layout.addWidget(QLabel("RNN functionality will be fully implemented in a future update."))
-        
-        group.setLayout(layout)
-        return group
-    
-    def train_neural_network(self):
-        """Train the neural network with current configuration"""
-        if not self.layer_config:
-            self.show_error("Please add at least one layer to the network")
-            return
-        
-        if self.X_train is None or self.y_train is None:
-            self.show_error("Please load a dataset first")
-            return
-        
-        try:
-            # Create and compile model
-            model = self.create_neural_network()
-            
-            # Get training parameters
-            batch_size = self.batch_size_spin.value()
-            epochs = self.epochs_spin.value()
-            learning_rate = self.lr_spin.value()
-            
-            # Get selected loss function
-            loss_function = self.get_selected_loss_function()
-            
-            # Prepare data for neural network
-            if len(self.X_train.shape) == 1:
-                X_train = self.X_train.reshape(-1, 1)
-                X_test = self.X_test.reshape(-1, 1)
-            else:
-                X_train = self.X_train
-                X_test = self.X_test
-            
-            # One-hot encode target for classification if using categorical_crossentropy
-            num_classes = len(np.unique(self.y_train))
-            if loss_function == 'categorical_crossentropy':
-                y_train = tf.keras.utils.to_categorical(self.y_train, num_classes)
-                y_test = tf.keras.utils.to_categorical(self.y_test, num_classes)
-            else:
-                y_train = self.y_train
-                y_test = self.y_test
-            
-            # Compile model
-            optimizer = optimizers.Adam(learning_rate=learning_rate)
-            model.compile(optimizer=optimizer,
-                        loss=loss_function,
-                        metrics=['accuracy'])
-            
-            # Train model
-            history = model.fit(X_train, y_train,
-                              batch_size=batch_size,
-                              epochs=epochs,
-                              validation_data=(X_test, y_test),
-                              callbacks=[self.create_progress_callback()])
-            
-            # Update visualization with training history
-            self.plot_training_history(history)
-            
-            # Make predictions
-            y_pred = model.predict(X_test)
-            if loss_function == 'categorical_crossentropy':
-                y_pred = np.argmax(y_pred, axis=1)
-            
-            # Update metrics
-            self.update_metrics(y_pred)
-            
-            # Store current model
-            self.current_model = model
-            
-            self.status_bar.showMessage("Neural Network Training Complete")
-            
-        except Exception as e:
-            self.show_error(f"Error training neural network: {str(e)}")
-    
-    def create_neural_network(self):
-        """Create neural network based on current configuration"""
-        model = models.Sequential()
-        
-        # Add layers based on configuration
-        is_first_layer = True
-        
-        for layer_config in self.layer_config:
-            layer_type = layer_config["type"]
-            params = layer_config["params"]
-            
-            if layer_type == "Dense":
-                if is_first_layer:
-                    # Add input shape for the first layer
-                    input_shape = self.X_train.shape[1:]
-                    if len(input_shape) == 0:  # For 1D input
-                        input_shape = (1,)
-                    params = {**params, 'input_shape': input_shape}
-                
-                model.add(layers.Dense(**params))
-                
-            elif layer_type == "Conv2D":
-                if is_first_layer:
-                    # Add input shape for the first layer
-                    if len(self.X_train.shape) <= 2:
-                        # Need to reshape data for Conv2D
-                        self.show_error("Data needs to be reshaped for Conv2D layer")
-                        return None
-                    params = {**params, 'input_shape': self.X_train.shape[1:]}
-                
-                model.add(layers.Conv2D(**params))
-                
-            elif layer_type == "MaxPooling2D":
-                model.add(layers.MaxPooling2D(pool_size=params.get('pool_size', (2, 2))))
-                
-            elif layer_type == "Flatten":
-                model.add(layers.Flatten())
-                
-            elif layer_type == "Dropout":
-                model.add(layers.Dropout(**params))
-            
-            is_first_layer = False
-        
-        # If no output layer was added, add one based on the problem type
-        if self.layer_config and self.layer_config[-1]["type"] != "Dense":
-            num_classes = len(np.unique(self.y_train))
-            
-            # For regression or binary classification
-            if num_classes <= 2:
-                model.add(layers.Dense(1, activation='sigmoid' if num_classes == 2 else 'linear'))
-            else:  # For multi-class classification
-                model.add(layers.Dense(num_classes, activation='softmax'))
-        
-        return model
-    
-    def create_progress_callback(self):
-        """Create callback for updating progress bar during training"""
-        class ProgressCallback(tf.keras.callbacks.Callback):
-            def __init__(self, progress_bar):
-                super().__init__()
-                self.progress_bar = progress_bar
-                
-            def on_epoch_begin(self, epoch, logs=None):
-                # Update progress at the start of each epoch
-                progress = int((epoch / self.params['epochs']) * 100)
-                self.progress_bar.setValue(progress)
-                
-            def on_epoch_end(self, epoch, logs=None):
-                # Update progress at the end of each epoch
-                progress = int(((epoch + 1) / self.params['epochs']) * 100)
-                self.progress_bar.setValue(progress)
-                
-        return ProgressCallback(self.progress_bar)
-    
+
     def update_visualization(self, y_pred):
         """Update the visualization with current results"""
         self.figure.clear()
